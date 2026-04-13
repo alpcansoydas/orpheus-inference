@@ -123,6 +123,5 @@ class OrpheusEngine:
             enable_chunked_prefill=cfg.enable_chunked_prefill,
             enable_prefix_caching=cfg.enable_prefix_caching,
             block_size=cfg.block_size,
-            disable_log_requests=True,
         )
         return AsyncLLMEngine.from_engine_args(args)
