@@ -3,11 +3,12 @@ from __future__ import annotations
 import logging
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncIterator
 
 import orjson
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 
 from .config import settings
 from .decoder import SNACDecoder
@@ -47,6 +48,14 @@ app = FastAPI(
     lifespan=lifespan,
     default_response_class=StreamingResponse,
 )
+
+
+_STATIC_DIR = Path(__file__).parent / "static"
+
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+async def ui():
+    return HTMLResponse((_STATIC_DIR / "index.html").read_text())
 
 
 # ── helpers ───────────────────────────────────────────────────────

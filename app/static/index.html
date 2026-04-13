@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Orpheus TTS</title>
+<style>
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  :root{
+    --bg:#0f1117;--surface:#1a1d27;--border:#2a2d3a;
+    --text:#e4e6f0;--muted:#8b8fa3;--accent:#6c63ff;
+    --accent-hover:#5a52e0;--danger:#ef4444;--radius:10px;
+  }
+  body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;justify-content:center;padding:2rem 1rem}
+  .app{width:100%;max-width:640px;display:flex;flex-direction:column;gap:1.25rem}
+  h1{font-size:1.5rem;font-weight:600;letter-spacing:-.02em}
+  h1 span{color:var(--accent)}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:1.25rem;display:flex;flex-direction:column;gap:1rem}
+  label{font-size:.8rem;font-weight:500;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+  textarea{width:100%;resize:vertical;min-height:90px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:.75rem;color:var(--text);font-size:.95rem;font-family:inherit;transition:border-color .15s}
+  textarea:focus{outline:none;border-color:var(--accent)}
+  .params{display:grid;grid-template-columns:1fr 1fr;gap:.75rem}
+  .field{display:flex;flex-direction:column;gap:.3rem}
+  select,input[type=range]{width:100%;accent-color:var(--accent)}
+  select{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:.45rem .5rem;color:var(--text);font-size:.85rem;cursor:pointer}
+  select:focus{outline:none;border-color:var(--accent)}
+  .range-row{display:flex;align-items:center;gap:.5rem}
+  .range-row input{flex:1}
+  .range-val{font-size:.8rem;min-width:2.5rem;text-align:right;color:var(--text);font-variant-numeric:tabular-nums}
+  button{padding:.7rem 1.5rem;border:none;border-radius:8px;font-size:.9rem;font-weight:600;cursor:pointer;transition:background .15s,opacity .15s}
+  .btn-primary{background:var(--accent);color:#fff}
+  .btn-primary:hover:not(:disabled){background:var(--accent-hover)}
+  .btn-primary:disabled{opacity:.5;cursor:not-allowed}
+  .btn-stop{background:var(--danger);color:#fff;display:none}
+  .btn-stop:hover{opacity:.85}
+  .actions{display:flex;gap:.5rem}
+  .status-bar{display:flex;align-items:center;gap:.6rem;font-size:.8rem;color:var(--muted);min-height:1.5rem}
+  .dot{width:8px;height:8px;border-radius:50%;background:#444;flex-shrink:0}
+  .dot.connected{background:#22c55e}
+  .dot.generating{background:var(--accent);animation:pulse .8s infinite alternate}
+  .dot.error{background:var(--danger)}
+  @keyframes pulse{from{opacity:1}to{opacity:.4}}
+  .player-area{display:flex;flex-direction:column;gap:.75rem}
+  .waveform{height:48px;background:var(--bg);border-radius:6px;overflow:hidden;position:relative}
+  .waveform canvas{width:100%;height:100%}
+  audio{width:100%;height:36px;border-radius:6px}
+</style>
+</head>
+<body>
+<div class="app">
+  <h1><span>Orpheus</span> TTS</h1>
+
+  <div class="card">
+    <div class="field">
+      <label for="text-input">Text</label>
+      <textarea id="text-input" placeholder="Type something to synthesize…">Hello! This is a test of the Orpheus text-to-speech system.</textarea>
+    </div>
+
+    <div class="params">
+      <div class="field">
+        <label for="voice">Voice</label>
+        <select id="voice"></select>
+      </div>
+      <div class="field">
+        <label for="temperature">Temperature <span class="range-val" id="temp-val">0.4</span></label>
+        <input type="range" id="temperature" min="0" max="2" step="0.05" value="0.4">
+      </div>
+      <div class="field">
+        <label for="top-p">Top P <span class="range-val" id="topp-val">0.9</span></label>
+        <input type="range" id="top-p" min="0" max="1" step="0.05" value="0.9">
+      </div>
+      <div class="field">
+        <label for="rep-penalty">Repetition Penalty <span class="range-val" id="rep-val">1.1</span></label>
+        <input type="range" id="rep-penalty" min="1" max="2" step="0.05" value="1.1">
+      </div>
+      <div class="field">
+        <label for="max-tokens">Max Tokens <span class="range-val" id="tok-val">1200</span></label>
+        <input type="range" id="max-tokens" min="100" max="4096" step="50" value="1200">
+      </div>
+    </div>
+
+    <div class="actions">
+      <button class="btn-primary" id="btn-generate">Generate</button>
+      <button class="btn-stop" id="btn-stop">Stop</button>
+    </div>
+  </div>
+
+  <div class="card player-area">
+    <div class="status-bar">
+      <div class="dot" id="status-dot"></div>
+      <span id="status-text">Ready</span>
+    </div>
+    <div class="waveform"><canvas id="waveform"></canvas></div>
+    <audio id="audio-player" controls></audio>
+  </div>
+</div>
+
+<script>
+const SAMPLE_RATE = 24000;
+
+const $text     = document.getElementById('text-input');
+const $voice    = document.getElementById('voice');
+const $temp     = document.getElementById('temperature');
+const $topP     = document.getElementById('top-p');
+const $rep      = document.getElementById('rep-penalty');
+const $maxTok   = document.getElementById('max-tokens');
+const $btnGen   = document.getElementById('btn-generate');
+const $btnStop  = document.getElementById('btn-stop');
+const $dot      = document.getElementById('status-dot');
+const $status   = document.getElementById('status-text');
+const $canvas   = document.getElementById('waveform');
+const $audio    = document.getElementById('audio-player');
+const ctx2d     = $canvas.getContext('2d');
+
+let ws = null;
+let audioCtx = null;
+let nextPlayTime = 0;
+let pcmChunks = [];
+let isGenerating = false;
+let waveformData = [];
+
+// range display sync
+const rangeMap = [
+  [$temp,   'temp-val'],
+  [$topP,   'topp-val'],
+  [$rep,    'rep-val'],
+  [$maxTok, 'tok-val'],
+];
+rangeMap.forEach(([slider, id]) => {
+  const display = document.getElementById(id);
+  slider.addEventListener('input', () => { display.textContent = slider.value; });
+});
+
+// fetch voices
+(async () => {
+  try {
+    const res = await fetch('/v1/voices');
+    const data = await res.json();
+    data.voices.forEach(v => {
+      const opt = document.createElement('option');
+      opt.value = v.id;
+      opt.textContent = v.name;
+      if (v.id === data.default) opt.selected = true;
+      $voice.appendChild(opt);
+    });
+  } catch {
+    ['tara','zoe','jess','zac','leo','mia','julia','leah'].forEach(v => {
+      const opt = document.createElement('option');
+      opt.value = v;
+      opt.textContent = v.charAt(0).toUpperCase() + v.slice(1);
+      $voice.appendChild(opt);
+    });
+  }
+})();
+
+function setStatus(state, msg) {
+  $dot.className = 'dot ' + state;
+  $status.textContent = msg;
+}
+
+function drawWaveform(samples) {
+  const W = $canvas.width  = $canvas.clientWidth * devicePixelRatio;
+  const H = $canvas.height = $canvas.clientHeight * devicePixelRatio;
+  ctx2d.clearRect(0, 0, W, H);
+
+  if (!samples.length) return;
+
+  const step = Math.max(1, Math.floor(samples.length / W));
+  const mid = H / 2;
+  ctx2d.beginPath();
+  ctx2d.strokeStyle = '#6c63ff';
+  ctx2d.lineWidth = devicePixelRatio;
+
+  for (let i = 0; i < W; i++) {
+    const idx = Math.min(i * step, samples.length - 1);
+    const v = samples[idx];
+    const y = mid + v * mid * 0.9;
+    if (i === 0) ctx2d.moveTo(i, y);
+    else ctx2d.lineTo(i, y);
+  }
+  ctx2d.stroke();
+}
+
+function pcmToFloat32(arrayBuf) {
+  const int16 = new Int16Array(arrayBuf);
+  const f32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) {
+    f32[i] = int16[i] / 32768;
+  }
+  return f32;
+}
+
+function scheduleChunk(float32) {
+  if (!audioCtx) return;
+  const buf = audioCtx.createBuffer(1, float32.length, SAMPLE_RATE);
+  buf.getChannelData(0).set(float32);
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(audioCtx.destination);
+
+  const now = audioCtx.currentTime;
+  if (nextPlayTime < now) nextPlayTime = now;
+  src.start(nextPlayTime);
+  nextPlayTime += buf.duration;
+}
+
+function buildWav(chunks) {
+  const pcm = new Uint8Array(chunks.reduce((n, c) => n + c.byteLength, 0));
+  let off = 0;
+  for (const c of chunks) { pcm.set(new Uint8Array(c), off); off += c.byteLength; }
+
+  const dataSize = pcm.length;
+  const buf = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buf);
+
+  const writeStr = (o, s) => { for (let i = 0; i < s.length; i++) view.setUint8(o + i, s.charCodeAt(i)); };
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, SAMPLE_RATE, true);
+  view.setUint32(28, SAMPLE_RATE * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, 'data');
+  view.setUint32(40, dataSize, true);
+  new Uint8Array(buf, 44).set(pcm);
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+function startGeneration() {
+  const text = $text.value.trim();
+  if (!text) return;
+
+  pcmChunks = [];
+  waveformData = [];
+  isGenerating = true;
+  $btnGen.disabled = true;
+  $btnStop.style.display = 'inline-block';
+  $audio.src = '';
+  $audio.removeAttribute('src');
+  drawWaveform([]);
+
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+  nextPlayTime = 0;
+
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/v1/audio/speech/ws`);
+  ws.binaryType = 'arraybuffer';
+
+  let firstChunk = true;
+  let t0 = performance.now();
+
+  ws.onopen = () => {
+    setStatus('generating', 'Generating…');
+    t0 = performance.now();
+    ws.send(JSON.stringify({
+      input: text,
+      voice: $voice.value,
+      temperature: parseFloat($temp.value),
+      top_p: parseFloat($topP.value),
+      max_tokens: parseInt($maxTok.value),
+      repetition_penalty: parseFloat($rep.value),
+    }));
+  };
+
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === 'string') {
+      const msg = JSON.parse(ev.data);
+      if (msg.done) {
+        finishGeneration();
+      } else if (msg.error) {
+        setStatus('error', 'Error: ' + msg.error);
+        cleanUp();
+      }
+      return;
+    }
+
+    if (firstChunk) {
+      const ttfb = (performance.now() - t0).toFixed(0);
+      setStatus('generating', `Streaming… (TTFB ${ttfb} ms)`);
+      firstChunk = false;
+    }
+
+    pcmChunks.push(ev.data);
+    const f32 = pcmToFloat32(ev.data);
+    scheduleChunk(f32);
+
+    for (let i = 0; i < f32.length; i += 64) {
+      waveformData.push(f32[Math.min(i, f32.length - 1)]);
+    }
+    drawWaveform(waveformData);
+  };
+
+  ws.onerror = () => {
+    setStatus('error', 'WebSocket error');
+    cleanUp();
+  };
+
+  ws.onclose = () => {
+    if (isGenerating) finishGeneration();
+  };
+}
+
+function finishGeneration() {
+  if (!isGenerating) return;
+  isGenerating = false;
+
+  if (pcmChunks.length) {
+    const blob = buildWav(pcmChunks);
+    $audio.src = URL.createObjectURL(blob);
+  }
+  setStatus('connected', 'Done – use player to replay');
+  cleanUp();
+}
+
+function cleanUp() {
+  isGenerating = false;
+  $btnGen.disabled = false;
+  $btnStop.style.display = 'none';
+  if (ws && ws.readyState <= 1) ws.close();
+  ws = null;
+}
+
+function stopGeneration() {
+  if (audioCtx) {
+    audioCtx.close().catch(() => {});
+    audioCtx = null;
+  }
+  cleanUp();
+  setStatus('', 'Stopped');
+}
+
+$btnGen.addEventListener('click', startGeneration);
+$btnStop.addEventListener('click', stopGeneration);
+
+$text.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault();
+    startGeneration();
+  }
+});
+</script>
+</body>
+</html>
