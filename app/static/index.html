@@ -241,11 +241,14 @@ async function startGeneration() {
   drawWaveform([]);
 
   audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+  await audioCtx.resume();
   nextPlayTime = 0;
 
   abortCtrl = new AbortController();
   const t0 = performance.now();
   setStatus('generating', 'Generating…');
+
+  let totalBytes = 0;
 
   try {
     const resp = await fetch('/v1/audio/speech/stream', {
@@ -277,8 +280,6 @@ async function startGeneration() {
       const { done, value } = await reader.read();
       if (done) break;
 
-      // PCM is 16-bit (2 bytes per sample) — ensure we only process
-      // aligned data and carry any trailing odd byte to the next iteration.
       let chunk;
       if (leftover.length > 0) {
         chunk = new Uint8Array(leftover.length + value.length);
@@ -295,15 +296,18 @@ async function startGeneration() {
       }
       leftover = aligned < chunk.length ? chunk.slice(aligned) : new Uint8Array(0);
       const pcmBytes = chunk.slice(0, aligned);
+      const ab = pcmBytes.buffer.slice(pcmBytes.byteOffset, pcmBytes.byteOffset + pcmBytes.byteLength);
+      totalBytes += ab.byteLength;
 
       if (firstChunk) {
         const ttfb = (performance.now() - t0).toFixed(0);
         setStatus('generating', `Streaming… (TTFB ${ttfb} ms)`);
+        console.log(`[TTS] First chunk: ${ab.byteLength} bytes, TTFB ${ttfb} ms`);
         firstChunk = false;
       }
 
-      pcmChunks.push(pcmBytes.buffer.slice(pcmBytes.byteOffset, pcmBytes.byteOffset + pcmBytes.byteLength));
-      const f32 = pcmToFloat32(pcmBytes.buffer.slice(pcmBytes.byteOffset, pcmBytes.byteOffset + pcmBytes.byteLength));
+      pcmChunks.push(ab);
+      const f32 = pcmToFloat32(ab);
       scheduleChunk(f32);
 
       for (let i = 0; i < f32.length; i += 64) {
@@ -312,11 +316,13 @@ async function startGeneration() {
       drawWaveform(waveformData);
     }
 
+    console.log(`[TTS] Stream complete: ${pcmChunks.length} chunks, ${totalBytes} bytes total`);
     finishGeneration();
   } catch (e) {
     if (e.name === 'AbortError') {
       setStatus('', 'Stopped');
     } else {
+      console.error('[TTS] Stream error:', e);
       setStatus('error', 'Network error: ' + e.message);
     }
     cleanUp();
@@ -329,9 +335,15 @@ function finishGeneration() {
 
   if (pcmChunks.length) {
     const blob = buildWav(pcmChunks);
-    $audio.src = URL.createObjectURL(blob);
+    const url = URL.createObjectURL(blob);
+    console.log(`[TTS] WAV blob: ${blob.size} bytes, type=${blob.type}`);
+    $audio.src = url;
+    $audio.load();
+    setStatus('connected', 'Done – use player to replay');
+  } else {
+    console.warn('[TTS] No PCM chunks received');
+    setStatus('error', 'No audio data received');
   }
-  setStatus('connected', 'Done – use player to replay');
   cleanUp();
 }
 

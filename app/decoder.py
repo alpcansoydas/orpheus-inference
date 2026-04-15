@@ -112,40 +112,53 @@ class SNACDecoder:
         window_size = min_frames_subsequent * self.TOKENS_PER_FRAME
 
         async for text_delta in token_text_gen:
-            code = self._parse_token(text_delta, count)
-            if code is None or code <= 0:
-                continue
+            for raw_number in self._parse_all_tokens(text_delta):
+                code = raw_number - 10 - ((count % 7) * 4096)
+                if code < 0:
+                    continue
 
-            buffer.append(code)
-            count += 1
+                buffer.append(code)
+                count += 1
 
-            if not first_chunk_sent and count >= first_threshold:
-                audio = self.decode_tokens(buffer[-first_threshold:])
-                if audio:
-                    first_chunk_sent = True
-                    yield audio
-            elif first_chunk_sent and count % self.TOKENS_PER_FRAME == 0:
-                audio = self.decode_tokens(buffer[-window_size:])
-                if audio:
-                    yield audio
+                if not first_chunk_sent and count >= first_threshold:
+                    audio = self.decode_tokens(buffer[-first_threshold:])
+                    if audio:
+                        first_chunk_sent = True
+                        logger.debug("First audio chunk: %d bytes from %d tokens", len(audio), count)
+                        yield audio
+                elif first_chunk_sent and count % self.TOKENS_PER_FRAME == 0:
+                    audio = self.decode_tokens(buffer[-window_size:])
+                    if audio:
+                        yield audio
+
+        if buffer and not first_chunk_sent:
+            logger.warning("Stream ended with %d tokens but no audio was emitted", count)
 
     # ── internals ─────────────────────────────────────────────────
 
     @staticmethod
-    def _parse_token(text: str, index: int) -> int | None:
-        """Extract a SNAC code value from a ``<custom_token_N>`` string."""
-        text = text.strip()
-        pos = text.rfind(_CUSTOM_TOKEN_PREFIX)
-        if pos == -1:
-            return None
-        token = text[pos:]
-        if not token.endswith(_CUSTOM_TOKEN_SUFFIX):
-            return None
-        try:
-            number = int(token[len(_CUSTOM_TOKEN_PREFIX) : -len(_CUSTOM_TOKEN_SUFFIX)])
-            return number - 10 - ((index % 7) * 4096)
-        except (ValueError, TypeError):
-            return None
+    def _parse_all_tokens(text: str) -> list[int]:
+        """Extract all ``<custom_token_N>`` numbers from a text delta.
+
+        A single vLLM delta may contain more than one token when the
+        event-loop batches updates, so we must capture every occurrence.
+        """
+        results: list[int] = []
+        search_from = 0
+        while True:
+            start = text.find(_CUSTOM_TOKEN_PREFIX, search_from)
+            if start == -1:
+                break
+            end = text.find(_CUSTOM_TOKEN_SUFFIX, start + len(_CUSTOM_TOKEN_PREFIX))
+            if end == -1:
+                break
+            try:
+                number = int(text[start + len(_CUSTOM_TOKEN_PREFIX) : end])
+                results.append(number)
+            except (ValueError, TypeError):
+                pass
+            search_from = end + len(_CUSTOM_TOKEN_SUFFIX)
+        return results
 
     def _warmup(self) -> None:
         dummy = [

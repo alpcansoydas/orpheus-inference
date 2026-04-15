@@ -82,12 +82,20 @@ async def _audio_stream(req: TTSRequest) -> AsyncIterator[bytes]:
         repetition_penalty=req.repetition_penalty,
     )
 
+    chunk_idx = 0
+    total_bytes = 0
     async for chunk in decoder.decode_stream(
         token_gen,
         min_frames_first=settings.min_frames_first,
         min_frames_subsequent=settings.min_frames_subsequent,
     ):
+        total_bytes += len(chunk)
+        chunk_idx += 1
+        if chunk_idx <= 3 or chunk_idx % 20 == 0:
+            logger.debug("Audio chunk #%d: %d bytes (total %d)", chunk_idx, len(chunk), total_bytes)
         yield chunk
+
+    logger.info("Stream finished: %d chunks, %d bytes", chunk_idx, total_bytes)
 
 
 # ── HTTP endpoints ────────────────────────────────────────────────
