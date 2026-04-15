@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from .config import settings
 from .decoder import SNACDecoder
@@ -52,7 +52,7 @@ app = FastAPI(
     title="Orpheus TTS",
     version="0.1.0",
     lifespan=lifespan,
-    default_response_class=StreamingResponse,
+    default_response_class=JSONResponse,
 )
 
 
@@ -255,6 +255,7 @@ async def tts_full(req: TTSRequest):
 
 @app.post(
     "/v1/audio/speech/metrics",
+    response_class=JSONResponse,
     response_model=SpeechMetricsResponse,
     summary="Generate speech and return per-request timing metrics",
 )

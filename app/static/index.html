@@ -496,6 +496,11 @@ async function startGeneration() {
   const payload = buildRequestPayload();
   if (!payload.input || isGenerating || isLoadTesting) return;
 
+  if (audioCtx) {
+    await audioCtx.close().catch(() => {});
+    audioCtx = null;
+  }
+
   pcmChunks = [];
   waveformData = [];
   isGenerating = true;
@@ -601,15 +606,15 @@ function finishGeneration(totalBytes) {
 function cleanUpGeneration() {
   isGenerating = false;
   abortCtrl = null;
-  if (audioCtx) {
-    audioCtx.close().catch(() => {});
-    audioCtx = null;
-  }
   setBusyButtons();
 }
 
 function stopGeneration() {
   if (abortCtrl) abortCtrl.abort();
+  if (audioCtx) {
+    audioCtx.close().catch(() => {});
+    audioCtx = null;
+  }
   cleanUpGeneration();
   setStatus('', 'Stopped');
 }
