@@ -51,6 +51,7 @@ class OrpheusEngine:
         top_p: float | None = None,
         max_tokens: int | None = None,
         repetition_penalty: float | None = None,
+        request_id: str | None = None,
     ) -> AsyncIterator[str]:
         """Yield token-text deltas (e.g. ``<custom_token_10010>``) as they
         are produced by the model.  The caller is expected to feed these into
@@ -66,7 +67,7 @@ class OrpheusEngine:
             stop_token_ids=cfg.stop_token_id_list,
         )
 
-        request_id = uuid.uuid4().hex
+        request_id = request_id or uuid.uuid4().hex
         prev_len = 0
 
         async for output in self._engine.generate(

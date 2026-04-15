@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
@@ -12,7 +13,13 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from .config import settings
 from .decoder import SNACDecoder
 from .engine import OrpheusEngine
-from .schemas import HealthResponse, TTSRequest, VoiceInfo, VoicesResponse
+from .schemas import (
+    HealthResponse,
+    SpeechMetricsResponse,
+    TTSRequest,
+    VoiceInfo,
+    VoicesResponse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +105,72 @@ async def _audio_stream(req: TTSRequest) -> AsyncIterator[bytes]:
     logger.info("Stream finished: %d chunks, %d bytes", chunk_idx, total_bytes)
 
 
+async def _collect_speech_metrics(req: TTSRequest) -> SpeechMetricsResponse:
+    """Run the full pipeline and return latency and throughput metrics."""
+    assert engine is not None and decoder is not None  # noqa: S101
+
+    request_id = uuid.uuid4().hex
+    started = time.perf_counter()
+    first_token_ms: float | None = None
+    first_audio_chunk_ms: float | None = None
+    token_deltas = 0
+    codec_tokens = 0
+    audio_chunks = 0
+    audio_bytes = 0
+
+    async def _instrumented_tokens() -> AsyncIterator[str]:
+        nonlocal first_token_ms, token_deltas, codec_tokens
+
+        async for delta in engine.generate_tokens(
+            text=req.input,
+            voice=req.voice,
+            temperature=req.temperature,
+            top_p=req.top_p,
+            max_tokens=req.max_tokens,
+            repetition_penalty=req.repetition_penalty,
+            request_id=request_id,
+        ):
+            token_count = decoder.count_codec_tokens(delta)
+            if token_count:
+                token_deltas += 1
+                codec_tokens += token_count
+                if first_token_ms is None:
+                    first_token_ms = (time.perf_counter() - started) * 1000
+            yield delta
+
+    async for chunk in decoder.decode_stream(
+        _instrumented_tokens(),
+        min_frames_first=settings.min_frames_first,
+        min_frames_subsequent=settings.min_frames_subsequent,
+    ):
+        audio_chunks += 1
+        audio_bytes += len(chunk)
+        if first_audio_chunk_ms is None:
+            first_audio_chunk_ms = (time.perf_counter() - started) * 1000
+
+    total_generation_ms = (time.perf_counter() - started) * 1000
+    logger.info(
+        "Metrics request complete: id=%s first_token=%.1fms first_audio=%.1fms total=%.1fms",
+        request_id,
+        first_token_ms or -1.0,
+        first_audio_chunk_ms or -1.0,
+        total_generation_ms,
+    )
+    return SpeechMetricsResponse(
+        request_id=request_id,
+        status="completed",
+        voice=req.voice,
+        input_chars=len(req.input),
+        token_deltas=token_deltas,
+        codec_tokens=codec_tokens,
+        audio_chunks=audio_chunks,
+        audio_bytes=audio_bytes,
+        first_token_ms=first_token_ms,
+        first_audio_chunk_ms=first_audio_chunk_ms,
+        total_generation_ms=total_generation_ms,
+    )
+
+
 # ── HTTP endpoints ────────────────────────────────────────────────
 
 
@@ -178,6 +251,16 @@ async def tts_full(req: TTSRequest):
         media_type="audio/wav",
         headers={"Content-Disposition": 'attachment; filename="speech.wav"'},
     )
+
+
+@app.post(
+    "/v1/audio/speech/metrics",
+    response_model=SpeechMetricsResponse,
+    summary="Generate speech and return per-request timing metrics",
+)
+async def tts_metrics(req: TTSRequest):
+    _validate_voice(req.voice)
+    return await _collect_speech_metrics(req)
 
 
 # ── utility endpoints ─────────────────────────────────────────────

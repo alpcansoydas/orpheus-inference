@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -27,3 +29,17 @@ class HealthResponse(BaseModel):
     status: str
     engine_ready: bool
     decoder_ready: bool
+
+
+class SpeechMetricsResponse(BaseModel):
+    request_id: str
+    status: Literal["completed"]
+    voice: str
+    input_chars: int
+    token_deltas: int
+    codec_tokens: int
+    audio_chunks: int
+    audio_bytes: int
+    first_token_ms: float | None
+    first_audio_chunk_ms: float | None
+    total_generation_ms: float

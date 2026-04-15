@@ -73,6 +73,35 @@ curl -X POST http://localhost:8000/v1/audio/speech \
   --output speech.wav
 ```
 
+### `POST /v1/audio/speech/metrics`
+
+Runs the full generation pipeline and returns timing metrics instead of audio.
+This is useful for concurrency testing and latency budgeting from the built-in UI.
+
+```bash
+curl -X POST http://localhost:8000/v1/audio/speech/metrics \
+  -H "Content-Type: application/json" \
+  -d '{"input": "Hello, how are you today?", "voice": "tara"}'
+```
+
+Example response:
+
+```json
+{
+  "request_id": "8e2d3f...",
+  "status": "completed",
+  "voice": "tara",
+  "input_chars": 29,
+  "token_deltas": 154,
+  "codec_tokens": 617,
+  "audio_chunks": 88,
+  "audio_bytes": 360448,
+  "first_token_ms": 74.2,
+  "first_audio_chunk_ms": 191.6,
+  "total_generation_ms": 1842.9
+}
+```
+
 ### `WS /v1/audio/speech/ws`
 
 WebSocket endpoint for bidirectional streaming. Send a JSON message:
@@ -122,6 +151,15 @@ during audio decoding.
 ## Voices
 
 `tara` · `zoe` · `jess` · `zac` · `leo` · `mia` · `julia` · `leah`
+
+## Built-in UI
+
+The browser UI now includes:
+
+- Single-request streaming playback for listening tests
+- A concurrency load-test panel with selectable parallel request count
+- Aggregate P50/P95 latency stats and a per-request timing table
+- Budget checks for first-token and end-to-end generation latency
 
 ## License
 

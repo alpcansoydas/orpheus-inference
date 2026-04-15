@@ -171,6 +171,10 @@ class SNACDecoder:
             search_from = end + len(_CUSTOM_TOKEN_SUFFIX)
         return results
 
+    @classmethod
+    def count_codec_tokens(cls, text: str) -> int:
+        return len(cls._parse_all_tokens(text))
+
     def _warmup(self) -> None:
         dummy = [
             torch.randint(0, 4096, (1, 1), dtype=torch.int32, device=self._device),
