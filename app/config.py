@@ -30,9 +30,9 @@ class Settings(BaseSettings):
     snac_device: str = ""
 
     # ── Streaming tuning ──────────────────────────────────────────
-    # Number of complete 7-token frames needed before emitting the
-    # first audio chunk (lower → faster TTFB, potentially more artefacts).
-    min_frames_first: int = 1
+    # Minimum complete 7-token frames before attempting the first audio
+    # chunk.  Must be ≥ 2 so the SNAC output exceeds the warm-up region.
+    min_frames_first: int = 2
     # Sliding-window size (in frames) for subsequent chunks.
     min_frames_subsequent: int = 4
 
