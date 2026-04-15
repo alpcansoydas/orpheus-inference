@@ -45,15 +45,19 @@ class SNACDecoder:
 
     # ── public API ────────────────────────────────────────────────
 
-    # The SNAC decoder's causal convolutions produce warm-up artefacts
-    # in the first ~2048 samples.  We skip them and take everything after.
+    # The reference Orpheus decoder uses a rolling 4-frame window and keeps
+    # only the stable tail after the initial warm-up region.
     _WARMUP_SAMPLES: int = 2048
+    _STABLE_CHUNK_SAMPLES: int = 2048
+    _STREAM_WINDOW_FRAMES: int = 4
 
     def decode_tokens(self, token_values: list[int]) -> bytes | None:
         """Convert a list of SNAC code values (must be a multiple of 7) to
-        raw 16-bit PCM bytes.  Returns ``None`` when the input is too short,
-        contains out-of-range codes, or the SNAC output has no usable audio
-        past the warm-up region."""
+        raw 16-bit PCM bytes.
+
+        For streaming stability we keep only the 2048-sample tail from a
+        4-frame decode, matching the original Orpheus implementation.
+        """
         n = len(token_values)
         if n < self.TOKENS_PER_FRAME:
             return None
@@ -86,12 +90,14 @@ class SNACDecoder:
 
         with torch.inference_mode():
             audio_hat = self._model.decode(codes)
-            total_samples = audio_hat.shape[-1]
-
-            if total_samples <= self._WARMUP_SAMPLES:
+            if audio_hat.shape[-1] < self._WARMUP_SAMPLES + self._STABLE_CHUNK_SAMPLES:
                 return None
 
-            audio_slice = audio_hat[:, :, self._WARMUP_SAMPLES:]
+            audio_slice = audio_hat[
+                :,
+                :,
+                self._WARMUP_SAMPLES : self._WARMUP_SAMPLES + self._STABLE_CHUNK_SAMPLES,
+            ]
 
             if self._device == "cuda":
                 pcm = (audio_slice * 32767.0).round().to(torch.int16)
@@ -104,53 +110,39 @@ class SNACDecoder:
         self,
         token_text_gen: AsyncIterator[str],
         *,
-        min_frames_first: int = 2,
+        min_frames_first: int = 4,
         min_frames_subsequent: int = 4,
     ) -> AsyncIterator[bytes]:
         """Async generator: consumes ``<custom_token_…>`` text deltas and
         yields PCM audio chunks as soon as enough tokens accumulate.
 
-        *min_frames_first* controls the minimum complete frames (×7 tokens)
-        before attempting the **first** audio chunk.  The actual first chunk
-        may use more frames if the SNAC output is still too short.
-        *min_frames_subsequent* sets the sliding-window size for every
-        chunk after that.
+        Streaming is intentionally conservative here: we decode a rolling
+        4-frame window and emit the stable 2048-sample tail each time.
         """
         buffer: list[int] = []
         count = 0
-        first_chunk_sent = False
-        first_threshold = min_frames_first * self.TOKENS_PER_FRAME
-        window_size = min_frames_subsequent * self.TOKENS_PER_FRAME
+        window_frames = max(
+            min_frames_first,
+            min_frames_subsequent,
+            self._STREAM_WINDOW_FRAMES,
+        )
+        window_size = window_frames * self.TOKENS_PER_FRAME
 
         async for text_delta in token_text_gen:
             for raw_number in self._parse_all_tokens(text_delta):
                 code = raw_number - 10 - ((count % 7) * 4096)
-                if code < 0:
+                if code <= 0:
                     continue
 
                 buffer.append(code)
                 count += 1
 
-                if count % self.TOKENS_PER_FRAME != 0:
-                    continue
-
-                if not first_chunk_sent:
-                    if count < first_threshold:
-                        continue
-                    audio = self.decode_tokens(buffer)
-                    if audio:
-                        first_chunk_sent = True
-                        logger.debug(
-                            "First audio chunk: %d bytes from %d tokens (%d frames)",
-                            len(audio), count, count // self.TOKENS_PER_FRAME,
-                        )
-                        yield audio
-                else:
+                if count % self.TOKENS_PER_FRAME == 0 and count >= window_size:
                     audio = self.decode_tokens(buffer[-window_size:])
                     if audio:
                         yield audio
 
-        if buffer and not first_chunk_sent:
+        if buffer and count < window_size:
             logger.warning("Stream ended with %d tokens but no audio was emitted", count)
 
     # ── internals ─────────────────────────────────────────────────

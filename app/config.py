@@ -30,9 +30,9 @@ class Settings(BaseSettings):
     snac_device: str = ""
 
     # ── Streaming tuning ──────────────────────────────────────────
-    # Minimum complete 7-token frames before attempting the first audio
-    # chunk.  Must be ≥ 2 so the SNAC output exceeds the warm-up region.
-    min_frames_first: int = 2
+    # The reference streaming decoder uses a rolling 4-frame window and
+    # emits the stable tail from that decode.
+    min_frames_first: int = 4
     # Sliding-window size (in frames) for subsequent chunks.
     min_frames_subsequent: int = 4
 
