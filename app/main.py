@@ -6,8 +6,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
 
-import orjson
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 
 from .config import settings
@@ -171,42 +170,6 @@ async def tts_full(req: TTSRequest):
         media_type="audio/wav",
         headers={"Content-Disposition": 'attachment; filename="speech.wav"'},
     )
-
-
-# ── WebSocket endpoint ────────────────────────────────────────────
-
-
-@app.websocket("/v1/audio/speech/ws")
-async def tts_websocket(ws: WebSocket):
-    """Bidirectional WebSocket endpoint.
-
-    Send a JSON message matching :class:`TTSRequest` to start generation.
-    The server streams back binary PCM frames and a final JSON
-    ``{"done": true}`` message.
-    """
-    await ws.accept()
-    try:
-        while True:
-            raw = await ws.receive_text()
-            try:
-                data = orjson.loads(raw)
-                req = TTSRequest(**data)
-            except Exception as exc:
-                await ws.send_text(orjson.dumps({"error": str(exc)}).decode())
-                continue
-
-            if req.voice not in settings.voice_list:
-                await ws.send_text(
-                    orjson.dumps({"error": f"Unknown voice '{req.voice}'"}).decode()
-                )
-                continue
-
-            async for chunk in _audio_stream(req):
-                await ws.send_bytes(chunk)
-
-            await ws.send_text(orjson.dumps({"done": True}).decode())
-    except WebSocketDisconnect:
-        logger.debug("WebSocket client disconnected")
 
 
 # ── utility endpoints ─────────────────────────────────────────────

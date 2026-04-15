@@ -112,14 +112,13 @@ const $canvas   = document.getElementById('waveform');
 const $audio    = document.getElementById('audio-player');
 const ctx2d     = $canvas.getContext('2d');
 
-let ws = null;
+let abortCtrl = null;
 let audioCtx = null;
 let nextPlayTime = 0;
 let pcmChunks = [];
 let isGenerating = false;
 let waveformData = [];
 
-// range display sync
 const rangeMap = [
   [$temp,   'temp-val'],
   [$topP,   'topp-val'],
@@ -131,7 +130,6 @@ rangeMap.forEach(([slider, id]) => {
   slider.addEventListener('input', () => { display.textContent = slider.value; });
 });
 
-// fetch voices
 (async () => {
   try {
     const res = await fetch('/v1/voices');
@@ -184,9 +182,7 @@ function drawWaveform(samples) {
 function pcmToFloat32(arrayBuf) {
   const int16 = new Int16Array(arrayBuf);
   const f32 = new Float32Array(int16.length);
-  for (let i = 0; i < int16.length; i++) {
-    f32[i] = int16[i] / 32768;
-  }
+  for (let i = 0; i < int16.length; i++) f32[i] = int16[i] / 32768;
   return f32;
 }
 
@@ -231,7 +227,7 @@ function buildWav(chunks) {
   return new Blob([buf], { type: 'audio/wav' });
 }
 
-function startGeneration() {
+async function startGeneration() {
   const text = $text.value.trim();
   if (!text) return;
 
@@ -247,62 +243,84 @@ function startGeneration() {
   audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
   nextPlayTime = 0;
 
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(`${proto}//${location.host}/v1/audio/speech/ws`);
-  ws.binaryType = 'arraybuffer';
+  abortCtrl = new AbortController();
+  const t0 = performance.now();
+  setStatus('generating', 'Generating…');
 
-  let firstChunk = true;
-  let t0 = performance.now();
+  try {
+    const resp = await fetch('/v1/audio/speech/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        input: text,
+        voice: $voice.value,
+        temperature: parseFloat($temp.value),
+        top_p: parseFloat($topP.value),
+        max_tokens: parseInt($maxTok.value),
+        repetition_penalty: parseFloat($rep.value),
+      }),
+      signal: abortCtrl.signal,
+    });
 
-  ws.onopen = () => {
-    setStatus('generating', 'Generating…');
-    t0 = performance.now();
-    ws.send(JSON.stringify({
-      input: text,
-      voice: $voice.value,
-      temperature: parseFloat($temp.value),
-      top_p: parseFloat($topP.value),
-      max_tokens: parseInt($maxTok.value),
-      repetition_penalty: parseFloat($rep.value),
-    }));
-  };
-
-  ws.onmessage = (ev) => {
-    if (typeof ev.data === 'string') {
-      const msg = JSON.parse(ev.data);
-      if (msg.done) {
-        finishGeneration();
-      } else if (msg.error) {
-        setStatus('error', 'Error: ' + msg.error);
-        cleanUp();
-      }
+    if (!resp.ok) {
+      const err = await resp.text();
+      setStatus('error', `Error ${resp.status}: ${err}`);
+      cleanUp();
       return;
     }
 
-    if (firstChunk) {
-      const ttfb = (performance.now() - t0).toFixed(0);
-      setStatus('generating', `Streaming… (TTFB ${ttfb} ms)`);
-      firstChunk = false;
+    const reader = resp.body.getReader();
+    let firstChunk = true;
+    let leftover = new Uint8Array(0);
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      // PCM is 16-bit (2 bytes per sample) — ensure we only process
+      // aligned data and carry any trailing odd byte to the next iteration.
+      let chunk;
+      if (leftover.length > 0) {
+        chunk = new Uint8Array(leftover.length + value.length);
+        chunk.set(leftover);
+        chunk.set(value, leftover.length);
+      } else {
+        chunk = value;
+      }
+
+      const aligned = chunk.length - (chunk.length % 2);
+      if (aligned < 2) {
+        leftover = chunk;
+        continue;
+      }
+      leftover = aligned < chunk.length ? chunk.slice(aligned) : new Uint8Array(0);
+      const pcmBytes = chunk.slice(0, aligned);
+
+      if (firstChunk) {
+        const ttfb = (performance.now() - t0).toFixed(0);
+        setStatus('generating', `Streaming… (TTFB ${ttfb} ms)`);
+        firstChunk = false;
+      }
+
+      pcmChunks.push(pcmBytes.buffer.slice(pcmBytes.byteOffset, pcmBytes.byteOffset + pcmBytes.byteLength));
+      const f32 = pcmToFloat32(pcmBytes.buffer.slice(pcmBytes.byteOffset, pcmBytes.byteOffset + pcmBytes.byteLength));
+      scheduleChunk(f32);
+
+      for (let i = 0; i < f32.length; i += 64) {
+        waveformData.push(f32[Math.min(i, f32.length - 1)]);
+      }
+      drawWaveform(waveformData);
     }
 
-    pcmChunks.push(ev.data);
-    const f32 = pcmToFloat32(ev.data);
-    scheduleChunk(f32);
-
-    for (let i = 0; i < f32.length; i += 64) {
-      waveformData.push(f32[Math.min(i, f32.length - 1)]);
+    finishGeneration();
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      setStatus('', 'Stopped');
+    } else {
+      setStatus('error', 'Network error: ' + e.message);
     }
-    drawWaveform(waveformData);
-  };
-
-  ws.onerror = () => {
-    setStatus('error', 'WebSocket error');
     cleanUp();
-  };
-
-  ws.onclose = () => {
-    if (isGenerating) finishGeneration();
-  };
+  }
 }
 
 function finishGeneration() {
@@ -321,11 +339,11 @@ function cleanUp() {
   isGenerating = false;
   $btnGen.disabled = false;
   $btnStop.style.display = 'none';
-  if (ws && ws.readyState <= 1) ws.close();
-  ws = null;
+  abortCtrl = null;
 }
 
 function stopGeneration() {
+  if (abortCtrl) abortCtrl.abort();
   if (audioCtx) {
     audioCtx.close().catch(() => {});
     audioCtx = null;
