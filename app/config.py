@@ -9,9 +9,9 @@ class Settings(BaseSettings):
     # ── Models ────────────────────────────────────────────────────
     # Comma-separated list of model ids to load at startup. Each id must
     # resolve to an entry in the built-in ModelRegistry or in MODELS_FILE.
-    enabled_models: str = "orpheus-en,orpheus-tr"
+    enabled_models: str = "orpheus-tr"
     # Default model id used when a request does not specify ``model``.
-    default_model: str = "orpheus-en"
+    default_model: str = "orpheus-tr"
     # Optional JSON file with additional / overridden ``ModelProfile`` entries.
     models_file: str = ""
 
