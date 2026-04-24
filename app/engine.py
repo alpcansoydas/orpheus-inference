@@ -79,7 +79,7 @@ class OrpheusEngine:
         are produced by the model.  The caller is expected to feed these into
         :pymethod:`SNACDecoder.decode_stream`."""
         cfg = self._cfg
-        prompt = self._format_prompt(text, voice)
+        prompt_ids = self._format_prompt_ids(text, voice)
 
         sampling = SamplingParams(
             temperature=temperature if temperature is not None else cfg.temperature,
@@ -93,7 +93,7 @@ class OrpheusEngine:
         prev_len = 0
 
         async for output in self._engine.generate(
-            prompt=prompt,
+            {"prompt_token_ids": prompt_ids},
             sampling_params=sampling,
             request_id=request_id,
         ):
@@ -105,8 +105,8 @@ class OrpheusEngine:
 
     # ── prompt formatting ─────────────────────────────────────────
 
-    def _format_prompt(self, text: str, voice: str) -> str:
-        """Build the Orpheus prompt string with special control tokens.
+    def _format_prompt_ids(self, text: str, voice: str) -> list[int]:
+        """Build the Orpheus prompt as token IDs (passed directly to vLLM).
 
         Layout: ``[START_PROMPT] {voice}: {text} [EOT][AUDIO_1][AUDIO_2][START_AUDIO]``
         The ``{voice}:`` prefix is omitted for single-speaker checkpoints.
@@ -114,12 +114,11 @@ class OrpheusEngine:
         raw = f"{voice}: {text}" if voice else text
         input_ids = self._tokenizer.encode(raw, add_special_tokens=False)
 
-        full_ids = (
+        return (
             [_TOKEN_START_OF_PROMPT]
             + input_ids
             + [_TOKEN_EOT, _TOKEN_AUDIO_PREFIX_1, _TOKEN_AUDIO_PREFIX_2, _TOKEN_START_OF_AUDIO]
         )
-        return self._tokenizer.decode(full_ids)
 
     # ── factory helpers ───────────────────────────────────────────
 
