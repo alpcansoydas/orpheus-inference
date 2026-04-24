@@ -9,7 +9,6 @@ fi
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
-export VLLM_USE_V1="${VLLM_USE_V1:-0}"
 
 echo "──────────────────────────────────────────────────"
 echo "  Orpheus TTS Server"
