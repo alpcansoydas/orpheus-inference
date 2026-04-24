@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from typing import AsyncIterator
 
-from transformers import AutoTokenizer
-from vllm import SamplingParams
-from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.engine.async_llm_engine import AsyncLLMEngine
-
 from .config import Settings
 from .models_registry import ModelProfile
+
+# VLLM_USE_V1 must be in the environment before vllm is imported.
+_settings_early = Settings()
+if not _settings_early.vllm_use_v1 and "VLLM_USE_V1" not in os.environ:
+    os.environ["VLLM_USE_V1"] = "0"
+
+from transformers import AutoTokenizer  # noqa: E402
+from vllm import SamplingParams  # noqa: E402
+from vllm.engine.arg_utils import AsyncEngineArgs  # noqa: E402
+from vllm.engine.async_llm_engine import AsyncLLMEngine  # noqa: E402
 
 logger = logging.getLogger(__name__)
 

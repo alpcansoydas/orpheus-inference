@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     gpu_memory_utilization: float = 0.90
     per_model_gpu_memory_utilization: float = 0.0
     max_num_seqs: int = 64
-    max_num_batched_tokens: int = 2048
+    max_num_batched_tokens: int = 4096
     enable_chunked_prefill: bool = True
     enable_prefix_caching: bool = True
     block_size: int = 16
@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     # a bit of throughput for much lower VRAM usage and avoids startup crashes
     # on some GPUs / driver stacks.
     enforce_eager: bool = True
+    # Fall back to vLLM's V0 engine.  Required for models whose vocab_size
+    # is not a multiple of 8 (V1 profiling triggers CUDA illegal-memory-access).
+    vllm_use_v1: bool = True
 
     # ── Legacy single-model overrides ─────────────────────────────
     # If set, these override the ``orpheus-en`` profile's model/tokenizer.
