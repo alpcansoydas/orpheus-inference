@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -12,6 +13,13 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from .config import settings
 from .decoder import SNACDecoder
+
+# vLLM V1 is enabled by default in newer releases, but Orpheus-compatible
+# checkpoints can still hit startup crashes during V1 profiling/sampler
+# warmup. Allow operators to opt back into V1, but default this server to the
+# more compatible V0 engine unless VLLM_USE_V1 is already set explicitly.
+os.environ.setdefault("VLLM_USE_V1", "0")
+
 from .engine import OrpheusEngine
 from .models_registry import ModelProfile, ModelRegistry
 from .schemas import (

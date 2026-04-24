@@ -69,6 +69,12 @@ paths, but with `vllm==0.19.0` that can break weight loading for
 exact-shape checkpoints such as some Unsloth exports. Leave it at `0`
 unless you are intentionally testing an older compatibility workaround.
 
+`VLLM_USE_V1=0` is also the safer default for this server. Newer vLLM
+releases enable the V1 engine automatically, but some Orpheus-compatible
+checkpoints crash during V1 startup profiling or sampler warmup with CUDA
+illegal-memory-access errors. If you want to test V1 on your hardware and
+checkpoint, opt in explicitly by setting `VLLM_USE_V1=1`.
+
 ## Quick start
 
 ```bash
