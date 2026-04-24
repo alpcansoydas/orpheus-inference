@@ -32,9 +32,6 @@ class Settings(BaseSettings):
     # a bit of throughput for much lower VRAM usage and avoids startup crashes
     # on some GPUs / driver stacks.
     enforce_eager: bool = True
-    # Fall back to vLLM's V0 engine.  Required for models whose vocab_size
-    # is not a multiple of 8 (V1 profiling triggers CUDA illegal-memory-access).
-    vllm_use_v1: bool = True
 
     # ── Legacy single-model overrides ─────────────────────────────
     # If set, these override the ``orpheus-en`` profile's model/tokenizer.

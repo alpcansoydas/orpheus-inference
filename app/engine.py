@@ -1,24 +1,21 @@
 from __future__ import annotations
 
 import logging
-import os
 import uuid
 from typing import AsyncIterator
+
+from transformers import AutoConfig, AutoTokenizer
+from vllm import SamplingParams
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.engine.async_llm_engine import AsyncLLMEngine
 
 from .config import Settings
 from .models_registry import ModelProfile
 
-# VLLM_USE_V1 must be in the environment before vllm is imported.
-_settings_early = Settings()
-if not _settings_early.vllm_use_v1 and "VLLM_USE_V1" not in os.environ:
-    os.environ["VLLM_USE_V1"] = "0"
-
-from transformers import AutoTokenizer  # noqa: E402
-from vllm import SamplingParams  # noqa: E402
-from vllm.engine.arg_utils import AsyncEngineArgs  # noqa: E402
-from vllm.engine.async_llm_engine import AsyncLLMEngine  # noqa: E402
-
 logger = logging.getLogger(__name__)
+
+_VOCAB_PAD_MULTIPLE = 64
+
 
 # Orpheus special token IDs (fixed by the model vocabulary).
 _TOKEN_START_OF_PROMPT = 128259
@@ -148,6 +145,7 @@ class OrpheusEngine:
             cfg.max_model_len,
             gpu_memory_utilization,
         )
+        hf_overrides = OrpheusEngine._vocab_pad_overrides(profile.model_name)
         args = AsyncEngineArgs(
             model=profile.model_name,
             tokenizer=profile.tokenizer_name,
@@ -160,5 +158,31 @@ class OrpheusEngine:
             enable_prefix_caching=cfg.enable_prefix_caching,
             block_size=cfg.block_size,
             enforce_eager=cfg.enforce_eager,
+            hf_overrides=hf_overrides,
         )
         return AsyncLLMEngine.from_engine_args(args)
+
+    @staticmethod
+    def _vocab_pad_overrides(model_name: str) -> dict:
+        """Return ``hf_overrides`` that pad vocab_size to a multiple of
+        ``_VOCAB_PAD_MULTIPLE``.
+
+        vLLM V1's profiling kernels can trigger a CUDA illegal-memory-access
+        when vocab_size is not properly aligned.  Padding the config value
+        is safe: the weight loader copies the real rows and the extra rows
+        stay at zero, so they never influence sampling.
+        """
+        model_cfg = AutoConfig.from_pretrained(model_name)
+        vocab = model_cfg.vocab_size
+        remainder = vocab % _VOCAB_PAD_MULTIPLE
+        if remainder == 0:
+            return {}
+        padded = vocab + (_VOCAB_PAD_MULTIPLE - remainder)
+        logger.warning(
+            "Model vocab_size=%d is not a multiple of %d – padding to %d "
+            "via hf_overrides to avoid vLLM V1 profiling crash",
+            vocab,
+            _VOCAB_PAD_MULTIPLE,
+            padded,
+        )
+        return {"vocab_size": padded}
