@@ -172,6 +172,13 @@ class OrpheusEngine:
         )
         return AsyncLLMEngine.from_engine_args(args)
 
+    # vLLM V1's Triton top-k/top-p sampler kernel requires vocab_size to
+    # be aligned to its block stride.  Orpheus checkpoints often have an
+    # awkward vocab_size (e.g. 128262 = 2×3×21377) that isn't divisible,
+    # causing the kernel to read past the logits tensor.  Padding to 64
+    # is the smallest alignment that satisfies current Triton block sizes.
+    _VOCAB_PAD_MINIMUM = 64
+
     @staticmethod
     def _compute_hf_overrides(
         model_name: str,
@@ -179,14 +186,20 @@ class OrpheusEngine:
         *,
         pad_multiple: int,
     ) -> dict:
-        """Return ``hf_overrides`` ensuring ``vocab_size`` covers all tokens.
+        """Return ``hf_overrides`` ensuring ``vocab_size`` is correct and
+        aligned for vLLM's Triton sampling kernels.
 
-        Some Unsloth/LoRA exports keep the base Llama 3 vocab_size (128256)
-        in the config even though the checkpoint weights include embeddings
-        for the Orpheus control tokens (128257–128261).  When vLLM trusts
-        the config it allocates an embedding table that is too small, and any
-        forward pass that touches the extra tokens triggers a CUDA illegal-
-        memory-access.  We detect the mismatch here and fix it.
+        Two problems are handled:
+
+        1. **Too-small vocab** – Some Unsloth/LoRA exports keep the base
+           Llama 3 vocab_size (128256) even though the checkpoint includes
+           embeddings for the Orpheus control tokens (128257–128261).
+
+        2. **Triton alignment** – vLLM V1's ``_topk_topp_kernel`` processes
+           logits in fixed-size blocks.  If ``vocab_size`` is not a multiple
+           of the block stride the kernel reads past the tensor and crashes
+           with ``CUDA: an illegal memory access``.  We pad to at least 64
+           (overridable via ``PAD_VOCAB_TO_MULTIPLE``).
         """
         model_cfg = AutoConfig.from_pretrained(model_name)
         config_vocab = model_cfg.vocab_size
@@ -197,19 +210,19 @@ class OrpheusEngine:
             OrpheusEngine._MIN_VOCAB_SIZE,
         )
 
-        if pad_multiple > 1:
-            remainder = required % pad_multiple
-            if remainder:
-                required += pad_multiple - remainder
+        pad = max(pad_multiple, OrpheusEngine._VOCAB_PAD_MINIMUM)
+        remainder = required % pad
+        if remainder:
+            required += pad - remainder
 
         if required == config_vocab:
             return {}
 
         logger.warning(
-            "Model config vocab_size=%d is smaller than required (%d). "
-            "Overriding via hf_overrides so the embedding table covers all "
-            "Orpheus control tokens and tokenizer entries.",
+            "Model config vocab_size=%d → overriding to %d "
+            "(pad-to-%d alignment for Triton sampler + Orpheus control tokens).",
             config_vocab,
             required,
+            pad,
         )
         return {"vocab_size": required}
