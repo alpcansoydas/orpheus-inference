@@ -68,6 +68,11 @@ async def lifespan(_app: FastAPI):
             gpu_memory_utilization=per_model_gpu,
         )
 
+    import torch
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        logger.info("CUDA sync OK after engine init – GPU state is clean")
+
     decoder = SNACDecoder(settings.snac_model_name, device=settings.snac_device)
     logger.info(
         "Server ready – default model=%s – accepting requests",

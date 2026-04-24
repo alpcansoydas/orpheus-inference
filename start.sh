@@ -6,6 +6,10 @@ if [ -f .env ]; then
     set -a; source .env; set +a
 fi
 
+# Make CUDA errors report the actual offending kernel (slower, but critical
+# for diagnosing illegal-memory-access crashes).
+export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-1}"
+
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
