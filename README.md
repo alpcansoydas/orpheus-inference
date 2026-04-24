@@ -51,13 +51,13 @@ few GB for KV cache and CUDA graphs. Depending on your GPU:
 | GPU VRAM       | Recommended setup                                                        |
 |----------------|--------------------------------------------------------------------------|
 | 40 GB+ (A100)  | `ENABLED_MODELS=orpheus-en,orpheus-tr`, default settings work            |
-| 24 GB (4090)   | `ENABLED_MODELS=orpheus-en,orpheus-tr` **and** `ENFORCE_EAGER=true`      |
+| 24 GB (4090)   | `ENABLED_MODELS=orpheus-en,orpheus-tr`, default settings work            |
 | 16 GB or less  | Load **one** model at a time: `ENABLED_MODELS=orpheus-tr` (or `-en`)     |
 
-`ENFORCE_EAGER=true` skips CUDA graph capture, which can save several GB
-per engine at the cost of a little throughput. If startup still fails
-with `num_gpu_blocks=0` / `CUDA error: illegal memory access`, drop to a
-single model or reduce `MAX_MODEL_LEN` / `MAX_NUM_SEQS`.
+`ENFORCE_EAGER=true` is now the default. It skips CUDA graph capture, which
+can save several GB per engine and avoid `CUDA error: illegal memory access`
+startup failures on some systems. If startup still fails, drop to a single
+model or reduce `MAX_MODEL_LEN` / `MAX_NUM_SEQS`.
 
 `PER_MODEL_GPU_MEMORY_UTILIZATION` lets you pin per-engine VRAM share
 explicitly if the automatic split (`GPU_MEMORY_UTILIZATION / n_models`)

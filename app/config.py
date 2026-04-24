@@ -28,10 +28,10 @@ class Settings(BaseSettings):
     enable_chunked_prefill: bool = True
     enable_prefix_caching: bool = True
     block_size: int = 16
-    # Disable CUDA graph capture. Trades a bit of throughput for much lower
-    # VRAM usage – often the difference between OOM and "works" when running
-    # multiple engines on a single GPU.
-    enforce_eager: bool = False
+    # Disable CUDA graph capture. This is enabled by default because it trades
+    # a bit of throughput for much lower VRAM usage and avoids startup crashes
+    # on some GPUs / driver stacks.
+    enforce_eager: bool = True
 
     # ── Legacy single-model overrides ─────────────────────────────
     # If set, these override the ``orpheus-en`` profile's model/tokenizer.
