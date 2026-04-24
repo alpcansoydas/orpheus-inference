@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from typing import AsyncIterator
@@ -48,13 +49,18 @@ class OrpheusEngine:
     ) -> None:
         self._cfg = cfg
         self._profile = profile
+        self._gpu_memory_utilization = (
+            gpu_memory_utilization or cfg.resolve_gpu_memory_utilization(1)
+        )
+        self._safe_mode = False
+        self._recovery_lock = asyncio.Lock()
         self._tokenizer = self._load_tokenizer(profile.tokenizer_name)
         self._engine = self._build_engine(
             cfg,
             profile,
             self._tokenizer,
-            gpu_memory_utilization=gpu_memory_utilization
-            or cfg.resolve_gpu_memory_utilization(1),
+            gpu_memory_utilization=self._gpu_memory_utilization,
+            safe_mode=self._safe_mode,
         )
         logger.info(
             "OrpheusEngine initialised – id=%s model=%s",
@@ -98,17 +104,31 @@ class OrpheusEngine:
         )
 
         request_id = request_id or uuid.uuid4().hex
-        prev_len = 0
+        try:
+            async for delta in self._generate_with_engine(
+                prompt_ids,
+                sampling,
+                request_id=request_id,
+            ):
+                yield delta
+        except Exception as exc:
+            if not self._should_recover_request_failure(exc):
+                raise
 
-        async for output in self._engine.generate(
-            {"prompt_token_ids": prompt_ids},
-            sampling_params=sampling,
-            request_id=request_id,
-        ):
-            new_text = output.outputs[0].text
-            delta = new_text[prev_len:]
-            prev_len = len(new_text)
-            if delta:
+            logger.warning(
+                "Generation failed for model=%s; rebuilding engine in "
+                "conservative mode and retrying once. Root cause: %s",
+                self._profile.model_name,
+                exc,
+            )
+            await self._rebuild_engine_for_safe_mode()
+
+            retry_request_id = uuid.uuid4().hex
+            async for delta in self._generate_with_engine(
+                prompt_ids,
+                sampling,
+                request_id=retry_request_id,
+            ):
                 yield delta
 
     # ── prompt formatting ─────────────────────────────────────────
@@ -142,14 +162,16 @@ class OrpheusEngine:
         tokenizer: AutoTokenizer,
         *,
         gpu_memory_utilization: float,
+        safe_mode: bool,
     ) -> AsyncLLMEngine:
         logger.info(
-            "Building vLLM engine – id=%s model=%s dtype=%s max_model_len=%d gpu_mem=%.2f",
+            "Building vLLM engine – id=%s model=%s dtype=%s max_model_len=%d gpu_mem=%.2f safe_mode=%s",
             profile.id,
             profile.model_name,
             cfg.dtype,
             cfg.max_model_len,
             gpu_memory_utilization,
+            safe_mode,
         )
         requested_pad = cfg.pad_vocab_to_multiple
 
@@ -160,6 +182,7 @@ class OrpheusEngine:
                 tokenizer,
                 gpu_memory_utilization=gpu_memory_utilization,
                 pad_multiple=requested_pad,
+                safe_mode=safe_mode,
             )
         except Exception as exc:
             fallback_pad = max(requested_pad, OrpheusEngine._VOCAB_PAD_MINIMUM)
@@ -182,6 +205,7 @@ class OrpheusEngine:
                 tokenizer,
                 gpu_memory_utilization=gpu_memory_utilization,
                 pad_multiple=fallback_pad,
+                safe_mode=safe_mode,
             )
 
     @staticmethod
@@ -192,6 +216,7 @@ class OrpheusEngine:
         *,
         gpu_memory_utilization: float,
         pad_multiple: int,
+        safe_mode: bool,
     ) -> AsyncLLMEngine:
         hf_overrides = OrpheusEngine._compute_hf_overrides(
             profile.model_name,
@@ -206,8 +231,8 @@ class OrpheusEngine:
             gpu_memory_utilization=gpu_memory_utilization,
             max_num_seqs=cfg.max_num_seqs,
             max_num_batched_tokens=cfg.max_num_batched_tokens,
-            enable_chunked_prefill=cfg.enable_chunked_prefill,
-            enable_prefix_caching=cfg.enable_prefix_caching,
+            enable_chunked_prefill=False if safe_mode else cfg.enable_chunked_prefill,
+            enable_prefix_caching=False if safe_mode else cfg.enable_prefix_caching,
             block_size=cfg.block_size,
             enforce_eager=cfg.enforce_eager,
             hf_overrides=hf_overrides,
@@ -231,6 +256,49 @@ class OrpheusEngine:
             or "illegal memory access" in message
             or "cuda error" in message
         )
+
+    @staticmethod
+    def _should_recover_request_failure(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return (
+            "enginedeaderror" in message
+            or "enginecore encountered an issue" in message
+            or "illegal memory access" in message
+            or "cuda error" in message
+        )
+
+    async def _generate_with_engine(
+        self,
+        prompt_ids: list[int],
+        sampling: SamplingParams,
+        *,
+        request_id: str,
+    ) -> AsyncIterator[str]:
+        prev_len = 0
+        async for output in self._engine.generate(
+            {"prompt_token_ids": prompt_ids},
+            sampling_params=sampling,
+            request_id=request_id,
+        ):
+            new_text = output.outputs[0].text
+            delta = new_text[prev_len:]
+            prev_len = len(new_text)
+            if delta:
+                yield delta
+
+    async def _rebuild_engine_for_safe_mode(self) -> None:
+        async with self._recovery_lock:
+            if self._safe_mode:
+                return
+
+            self._safe_mode = True
+            self._engine = self._build_engine(
+                self._cfg,
+                self._profile,
+                self._tokenizer,
+                gpu_memory_utilization=self._gpu_memory_utilization,
+                safe_mode=True,
+            )
 
     @staticmethod
     def _compute_hf_overrides(
