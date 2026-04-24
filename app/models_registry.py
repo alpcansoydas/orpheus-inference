@@ -70,8 +70,8 @@ _BUILTIN_PROFILES: tuple[ModelProfile, ...] = (
     ModelProfile(
         id="orpheus-tr",
         display_name="Orpheus 3B (Turkish, Unsloth fine-tune)",
-        model_name="yaltay/tmp_tmp_smp",
-        tokenizer_name="yaltay/tmp_tmp_smp",
+        model_name="yaltay/tmp_tmp_smp_vllm",
+        tokenizer_name="yaltay/tmp_tmp_smp_vllm",
         voices=(),
         default_voice=None,
         language="tr",

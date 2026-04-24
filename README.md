@@ -33,7 +33,7 @@ in the UI). Built-in profiles:
 | id           | Checkpoint                         | Language | Speakers        |
 |--------------|------------------------------------|----------|-----------------|
 | `orpheus-en` | `canopylabs/orpheus-3b-0.1-ft`     | English  | Multi (8 voices)|
-| `orpheus-tr` | `yaltay/tmp_tmp_smp`               | Turkish  | Single-speaker  |
+| `orpheus-tr` | `yaltay/tmp_tmp_smp_vllm`          | Turkish  | Single-speaker  |
 
 The Turkish profile is an Unsloth fine-tune of Orpheus 3B – it is a
 single-speaker model, so the `voice` field is ignored for it.
