@@ -210,10 +210,11 @@ class OrpheusEngine:
             OrpheusEngine._MIN_VOCAB_SIZE,
         )
 
-        pad = max(pad_multiple, OrpheusEngine._VOCAB_PAD_MINIMUM)
-        remainder = required % pad
-        if remainder:
-            required += pad - remainder
+        if pad_multiple > 0:
+            pad = max(pad_multiple, OrpheusEngine._VOCAB_PAD_MINIMUM)
+            remainder = required % pad
+            if remainder:
+                required += pad - remainder
 
         if required == config_vocab:
             return {}
