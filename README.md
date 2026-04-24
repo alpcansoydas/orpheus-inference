@@ -43,6 +43,26 @@ point `DEFAULT_MODEL` at the one you want to use when the request omits
 a model id. Additional custom profiles can be declared in a JSON file
 referenced by `MODELS_FILE`.
 
+### VRAM planning for multi-model setups
+
+Each Orpheus 3B engine needs roughly **8 GB of VRAM** for weights plus a
+few GB for KV cache and CUDA graphs. Depending on your GPU:
+
+| GPU VRAM       | Recommended setup                                                        |
+|----------------|--------------------------------------------------------------------------|
+| 40 GB+ (A100)  | `ENABLED_MODELS=orpheus-en,orpheus-tr`, default settings work            |
+| 24 GB (4090)   | `ENABLED_MODELS=orpheus-en,orpheus-tr` **and** `ENFORCE_EAGER=true`      |
+| 16 GB or less  | Load **one** model at a time: `ENABLED_MODELS=orpheus-tr` (or `-en`)     |
+
+`ENFORCE_EAGER=true` skips CUDA graph capture, which can save several GB
+per engine at the cost of a little throughput. If startup still fails
+with `num_gpu_blocks=0` / `CUDA error: illegal memory access`, drop to a
+single model or reduce `MAX_MODEL_LEN` / `MAX_NUM_SEQS`.
+
+`PER_MODEL_GPU_MEMORY_UTILIZATION` lets you pin per-engine VRAM share
+explicitly if the automatic split (`GPU_MEMORY_UTILIZATION / n_models`)
+isn't ideal.
+
 ## Quick start
 
 ```bash
