@@ -32,6 +32,13 @@ class OrpheusEngine:
     requests can be routed to the correct checkpoint at dispatch time.
     """
 
+    _MIN_VOCAB_SIZE = max(
+        _TOKEN_START_OF_PROMPT,
+        _TOKEN_AUDIO_PREFIX_1,
+        _TOKEN_AUDIO_PREFIX_2,
+        _TOKEN_START_OF_AUDIO,
+    ) + 1  # 128262 – embedding must cover all Orpheus control tokens
+
     def __init__(
         self,
         cfg: Settings,
@@ -45,6 +52,7 @@ class OrpheusEngine:
         self._engine = self._build_engine(
             cfg,
             profile,
+            self._tokenizer,
             gpu_memory_utilization=gpu_memory_utilization
             or cfg.resolve_gpu_memory_utilization(1),
         )
@@ -131,6 +139,7 @@ class OrpheusEngine:
     def _build_engine(
         cfg: Settings,
         profile: ModelProfile,
+        tokenizer: AutoTokenizer,
         *,
         gpu_memory_utilization: float,
     ) -> AsyncLLMEngine:
@@ -142,9 +151,10 @@ class OrpheusEngine:
             cfg.max_model_len,
             gpu_memory_utilization,
         )
-        hf_overrides = OrpheusEngine._vocab_pad_overrides(
+        hf_overrides = OrpheusEngine._compute_hf_overrides(
             profile.model_name,
-            multiple=cfg.pad_vocab_to_multiple,
+            tokenizer,
+            pad_multiple=cfg.pad_vocab_to_multiple,
         )
         args = AsyncEngineArgs(
             model=profile.model_name,
@@ -163,30 +173,43 @@ class OrpheusEngine:
         return AsyncLLMEngine.from_engine_args(args)
 
     @staticmethod
-    def _vocab_pad_overrides(model_name: str, *, multiple: int) -> dict:
-        """Return optional ``hf_overrides`` that pad ``vocab_size``.
+    def _compute_hf_overrides(
+        model_name: str,
+        tokenizer: AutoTokenizer,
+        *,
+        pad_multiple: int,
+    ) -> dict:
+        """Return ``hf_overrides`` ensuring ``vocab_size`` covers all tokens.
 
-        This is disabled by default because recent vLLM releases expect the
-        embedding weight shape to exactly match the configured vocab size.
-        Some older stacks benefitted from padding misaligned vocab sizes to
-        avoid profiling crashes, so we keep it as an explicit opt-in escape
-        hatch.
+        Some Unsloth/LoRA exports keep the base Llama 3 vocab_size (128256)
+        in the config even though the checkpoint weights include embeddings
+        for the Orpheus control tokens (128257–128261).  When vLLM trusts
+        the config it allocates an embedding table that is too small, and any
+        forward pass that touches the extra tokens triggers a CUDA illegal-
+        memory-access.  We detect the mismatch here and fix it.
         """
-        if multiple <= 1:
+        model_cfg = AutoConfig.from_pretrained(model_name)
+        config_vocab = model_cfg.vocab_size
+
+        required = max(
+            config_vocab,
+            len(tokenizer),
+            OrpheusEngine._MIN_VOCAB_SIZE,
+        )
+
+        if pad_multiple > 1:
+            remainder = required % pad_multiple
+            if remainder:
+                required += pad_multiple - remainder
+
+        if required == config_vocab:
             return {}
 
-        model_cfg = AutoConfig.from_pretrained(model_name)
-        vocab = model_cfg.vocab_size
-        remainder = vocab % multiple
-        if remainder == 0:
-            return {}
-        padded = vocab + (multiple - remainder)
         logger.warning(
-            "Model vocab_size=%d is not a multiple of %d – padding to %d "
-            "via hf_overrides. Enable this only if your vLLM stack needs the "
-            "compatibility workaround and your checkpoint still loads cleanly.",
-            vocab,
-            multiple,
-            padded,
+            "Model config vocab_size=%d is smaller than required (%d). "
+            "Overriding via hf_overrides so the embedding table covers all "
+            "Orpheus control tokens and tokenizer entries.",
+            config_vocab,
+            required,
         )
-        return {"vocab_size": padded}
+        return {"vocab_size": required}
