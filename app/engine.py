@@ -14,8 +14,6 @@ from .models_registry import ModelProfile
 
 logger = logging.getLogger(__name__)
 
-_VOCAB_PAD_MULTIPLE = 64
-
 
 # Orpheus special token IDs (fixed by the model vocabulary).
 _TOKEN_START_OF_PROMPT = 128259
@@ -145,7 +143,10 @@ class OrpheusEngine:
             cfg.max_model_len,
             gpu_memory_utilization,
         )
-        hf_overrides = OrpheusEngine._vocab_pad_overrides(profile.model_name)
+        hf_overrides = OrpheusEngine._vocab_pad_overrides(
+            profile.model_name,
+            multiple=cfg.pad_vocab_to_multiple,
+        )
         args = AsyncEngineArgs(
             model=profile.model_name,
             tokenizer=profile.tokenizer_name,
@@ -163,26 +164,30 @@ class OrpheusEngine:
         return AsyncLLMEngine.from_engine_args(args)
 
     @staticmethod
-    def _vocab_pad_overrides(model_name: str) -> dict:
-        """Return ``hf_overrides`` that pad vocab_size to a multiple of
-        ``_VOCAB_PAD_MULTIPLE``.
+    def _vocab_pad_overrides(model_name: str, *, multiple: int) -> dict:
+        """Return optional ``hf_overrides`` that pad ``vocab_size``.
 
-        vLLM V1's profiling kernels can trigger a CUDA illegal-memory-access
-        when vocab_size is not properly aligned.  Padding the config value
-        is safe: the weight loader copies the real rows and the extra rows
-        stay at zero, so they never influence sampling.
+        This is disabled by default because recent vLLM releases expect the
+        embedding weight shape to exactly match the configured vocab size.
+        Some older stacks benefitted from padding misaligned vocab sizes to
+        avoid profiling crashes, so we keep it as an explicit opt-in escape
+        hatch.
         """
+        if multiple <= 1:
+            return {}
+
         model_cfg = AutoConfig.from_pretrained(model_name)
         vocab = model_cfg.vocab_size
-        remainder = vocab % _VOCAB_PAD_MULTIPLE
+        remainder = vocab % multiple
         if remainder == 0:
             return {}
-        padded = vocab + (_VOCAB_PAD_MULTIPLE - remainder)
+        padded = vocab + (multiple - remainder)
         logger.warning(
             "Model vocab_size=%d is not a multiple of %d – padding to %d "
-            "via hf_overrides to avoid vLLM V1 profiling crash",
+            "via hf_overrides. Enable this only if your vLLM stack needs the "
+            "compatibility workaround and your checkpoint still loads cleanly.",
             vocab,
-            _VOCAB_PAD_MULTIPLE,
+            multiple,
             padded,
         )
         return {"vocab_size": padded}

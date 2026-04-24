@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     # a bit of throughput for much lower VRAM usage and avoids startup crashes
     # on some GPUs / driver stacks.
     enforce_eager: bool = True
+    # Optional compatibility workaround for older vLLM stacks that crash when
+    # profiling a model whose vocab size is not aligned. Leave disabled for
+    # current vLLM releases because overriding vocab_size can break weight
+    # loading for exact-shape checkpoints (including some Unsloth exports).
+    pad_vocab_to_multiple: int = 0
 
     # ── Legacy single-model overrides ─────────────────────────────
     # If set, these override the ``orpheus-en`` profile's model/tokenizer.

@@ -63,6 +63,12 @@ model or reduce `MAX_MODEL_LEN` / `MAX_NUM_SEQS`.
 explicitly if the automatic split (`GPU_MEMORY_UTILIZATION / n_models`)
 isn't ideal.
 
+`PAD_VOCAB_TO_MULTIPLE` is disabled by default. Earlier builds used a
+`vocab_size` override to pad misaligned vocabularies for some vLLM profiling
+paths, but with `vllm==0.19.0` that can break weight loading for
+exact-shape checkpoints such as some Unsloth exports. Leave it at `0`
+unless you are intentionally testing an older compatibility workaround.
+
 ## Quick start
 
 ```bash
