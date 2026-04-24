@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     gpu_memory_utilization: float = 0.90
     per_model_gpu_memory_utilization: float = 0.0
     max_num_seqs: int = 64
-    max_num_batched_tokens: int = 4096
+    max_num_batched_tokens: int = 2048
     enable_chunked_prefill: bool = True
     enable_prefix_caching: bool = True
     block_size: int = 16
