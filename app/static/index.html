@@ -83,6 +83,10 @@
 
     <div class="params">
       <div class="field">
+        <label for="model">Model</label>
+        <select id="model"></select>
+      </div>
+      <div class="field" id="voice-field">
         <label for="voice">Voice</label>
         <select id="voice"></select>
       </div>
@@ -122,7 +126,7 @@
 
   <div class="card">
     <h2>Concurrency Load Test</h2>
-    <p class="subtle">Runs multiple requests in parallel against the metrics endpoint and reports first-token, first-audio, and end-to-end generation latency for every request.</p>
+    <p class="subtle">Runs multiple requests in parallel against the metrics endpoint and reports TTFT, TTFA, and end-to-end generation latency for every request.</p>
 
     <div class="load-controls">
       <div class="field">
@@ -150,8 +154,8 @@
       <div class="stat"><div class="stat-label">Wall Time</div><div class="stat-value" id="summary-wall">n/a</div></div>
       <div class="stat"><div class="stat-label">Throughput</div><div class="stat-value" id="summary-throughput">n/a</div></div>
       <div class="stat"><div class="stat-label">Within Budget</div><div class="stat-value" id="summary-budget">0</div></div>
-      <div class="stat"><div class="stat-label">First Token P50/P95</div><div class="stat-value" id="summary-first-token">n/a</div></div>
-      <div class="stat"><div class="stat-label">First Audio P50/P95</div><div class="stat-value" id="summary-first-audio">n/a</div></div>
+      <div class="stat"><div class="stat-label">TTFT P50/P95</div><div class="stat-value" id="summary-ttft">n/a</div></div>
+      <div class="stat"><div class="stat-label">TTFA P50/P95</div><div class="stat-value" id="summary-ttfa">n/a</div></div>
       <div class="stat"><div class="stat-label">Total P50/P95</div><div class="stat-value" id="summary-total">n/a</div></div>
       <div class="stat"><div class="stat-label">Failures</div><div class="stat-value" id="summary-failures">0</div></div>
     </div>
@@ -162,9 +166,12 @@
           <tr>
             <th>#</th>
             <th>Status</th>
+            <th>Sample</th>
+            <th>Model</th>
+            <th>Voice</th>
             <th>HTTP</th>
-            <th>First Token</th>
-            <th>First Audio</th>
+            <th>TTFT</th>
+            <th>TTFA</th>
             <th>Total</th>
             <th>Token Deltas</th>
             <th>Codec Tokens</th>
@@ -175,7 +182,7 @@
           </tr>
         </thead>
         <tbody id="loadtest-results">
-          <tr><td colspan="12" class="hint">No load test has been run yet.</td></tr>
+          <tr><td colspan="15" class="hint">No load test has been run yet.</td></tr>
         </tbody>
       </table>
     </div>
@@ -184,10 +191,37 @@
 
 <script>
 const SAMPLE_RATE = 24000;
-const FALLBACK_VOICES = ['tara', 'zoe', 'jess', 'zac', 'leo', 'mia', 'julia', 'leah'];
+const FALLBACK_MODELS = [
+  {
+    id: 'orpheus-en',
+    display_name: 'Orpheus 3B (English, multi-speaker)',
+    multi_speaker: true,
+    voices: [
+      { id: 'tara', name: 'Tara' },
+      { id: 'zoe', name: 'Zoe' },
+      { id: 'jess', name: 'Jess' },
+      { id: 'zac', name: 'Zac' },
+      { id: 'leo', name: 'Leo' },
+      { id: 'mia', name: 'Mia' },
+      { id: 'julia', name: 'Julia' },
+      { id: 'leah', name: 'Leah' },
+    ],
+    default_voice: 'tara',
+  },
+  {
+    id: 'orpheus-tr',
+    display_name: 'Orpheus 3B (Turkish, Unsloth fine-tune)',
+    multi_speaker: false,
+    voices: [],
+    default_voice: null,
+  },
+];
+const FALLBACK_DEFAULT_MODEL = 'orpheus-en';
 
 const $text = document.getElementById('text-input');
+const $model = document.getElementById('model');
 const $voice = document.getElementById('voice');
+const $voiceField = document.getElementById('voice-field');
 const $temp = document.getElementById('temperature');
 const $topP = document.getElementById('top-p');
 const $rep = document.getElementById('rep-penalty');
@@ -212,8 +246,8 @@ const summaryEls = {
   wall: document.getElementById('summary-wall'),
   throughput: document.getElementById('summary-throughput'),
   budget: document.getElementById('summary-budget'),
-  firstToken: document.getElementById('summary-first-token'),
-  firstAudio: document.getElementById('summary-first-audio'),
+  ttft: document.getElementById('summary-ttft'),
+  ttfa: document.getElementById('summary-ttfa'),
   total: document.getElementById('summary-total'),
   failures: document.getElementById('summary-failures'),
 };
@@ -227,6 +261,7 @@ let waveformData = [];
 let loadtestControllers = [];
 let loadtestState = null;
 let isLoadTesting = false;
+const modelProfiles = new Map();
 
 const rangeMap = [
   [$temp, 'temp-val'],
@@ -335,14 +370,19 @@ function buildWav(chunks) {
 }
 
 function buildRequestPayload() {
-  return {
+  const payload = {
     input: $text.value.trim(),
-    voice: $voice.value,
+    model: $model.value,
     temperature: parseFloat($temp.value),
     top_p: parseFloat($topP.value),
     max_tokens: parseInt($maxTok.value, 10),
     repetition_penalty: parseFloat($rep.value),
   };
+  const profile = modelProfiles.get($model.value);
+  if (profile && profile.multi_speaker) {
+    payload.voice = $voice.value;
+  }
+  return payload;
 }
 
 function formatMs(value) {
@@ -351,6 +391,22 @@ function formatMs(value) {
 
 function formatNumber(value) {
   return value == null ? 'n/a' : value.toLocaleString();
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function formatSample(value) {
+  if (!value) return 'n/a';
+  const compact = value.replace(/\s+/g, ' ').trim();
+  const truncated = compact.length > 64 ? `${compact.slice(0, 64)}...` : compact;
+  return `<span title="${escapeHtml(value)}">${escapeHtml(truncated)}</span>`;
 }
 
 function percentile(values, ratio) {
@@ -369,7 +425,7 @@ function collectMetric(field) {
 
 function renderLoadtestResults() {
   if (!loadtestState || !loadtestState.results.length) {
-    $loadtestResults.innerHTML = '<tr><td colspan="12" class="hint">No load test has been run yet.</td></tr>';
+    $loadtestResults.innerHTML = '<tr><td colspan="15" class="hint">No load test has been run yet.</td></tr>';
     return;
   }
 
@@ -377,16 +433,19 @@ function renderLoadtestResults() {
     <tr>
       <td>${result.index}</td>
       <td><span class="badge ${result.status}">${result.status}</span></td>
+      <td>${formatSample(result.sample)}</td>
+      <td>${escapeHtml(result.model || 'n/a')}</td>
+      <td>${escapeHtml(result.voice || '-')}</td>
       <td>${formatMs(result.httpMs)}</td>
-      <td>${formatMs(result.firstTokenMs)}</td>
-      <td>${formatMs(result.firstAudioChunkMs)}</td>
+      <td>${formatMs(result.ttftMs)}</td>
+      <td>${formatMs(result.ttfaMs)}</td>
       <td>${formatMs(result.totalGenerationMs)}</td>
       <td>${formatNumber(result.tokenDeltas)}</td>
       <td>${formatNumber(result.codecTokens)}</td>
       <td>${formatNumber(result.audioChunks)}</td>
       <td>${formatNumber(result.audioBytes)}</td>
-      <td>${result.requestId || 'n/a'}</td>
-      <td>${result.error || ''}</td>
+      <td>${escapeHtml(result.requestId || 'n/a')}</td>
+      <td>${escapeHtml(result.error || '')}</td>
     </tr>
   `).join('');
 }
@@ -397,8 +456,8 @@ function updateLoadtestSummary() {
     summaryEls.wall.textContent = 'n/a';
     summaryEls.throughput.textContent = 'n/a';
     summaryEls.budget.textContent = '0';
-    summaryEls.firstToken.textContent = 'n/a';
-    summaryEls.firstAudio.textContent = 'n/a';
+    summaryEls.ttft.textContent = 'n/a';
+    summaryEls.ttfa.textContent = 'n/a';
     summaryEls.total.textContent = 'n/a';
     summaryEls.failures.textContent = '0';
     return;
@@ -408,15 +467,15 @@ function updateLoadtestSummary() {
   const completed = results.filter((result) => result.status === 'completed').length;
   const failures = results.filter((result) => result.status === 'error' || result.status === 'aborted').length;
   const wallMs = (endedAt || performance.now()) - startedAt;
-  const firstTokenValues = collectMetric('firstTokenMs');
-  const firstAudioValues = collectMetric('firstAudioChunkMs');
+  const ttftValues = collectMetric('ttftMs');
+  const ttfaValues = collectMetric('ttfaMs');
   const totalValues = collectMetric('totalGenerationMs');
   const withinBudget = results.filter(
     (result) =>
       result.status === 'completed' &&
-      typeof result.firstTokenMs === 'number' &&
+      typeof result.ttfaMs === 'number' &&
       typeof result.totalGenerationMs === 'number' &&
-      result.firstTokenMs <= latencyBudgetMs &&
+      result.ttfaMs <= latencyBudgetMs &&
       result.totalGenerationMs <= latencyBudgetMs
   ).length;
 
@@ -424,8 +483,8 @@ function updateLoadtestSummary() {
   summaryEls.wall.textContent = formatMs(wallMs);
   summaryEls.throughput.textContent = wallMs > 0 ? `${(completed / (wallMs / 1000)).toFixed(2)} req/s` : 'n/a';
   summaryEls.budget.textContent = `${withinBudget} <= ${latencyBudgetMs.toLocaleString()} ms`;
-  summaryEls.firstToken.textContent = firstTokenValues.length ? `${formatMs(percentile(firstTokenValues, 0.5))} / ${formatMs(percentile(firstTokenValues, 0.95))}` : 'n/a';
-  summaryEls.firstAudio.textContent = firstAudioValues.length ? `${formatMs(percentile(firstAudioValues, 0.5))} / ${formatMs(percentile(firstAudioValues, 0.95))}` : 'n/a';
+  summaryEls.ttft.textContent = ttftValues.length ? `${formatMs(percentile(ttftValues, 0.5))} / ${formatMs(percentile(ttftValues, 0.95))}` : 'n/a';
+  summaryEls.ttfa.textContent = ttfaValues.length ? `${formatMs(percentile(ttfaValues, 0.5))} / ${formatMs(percentile(ttfaValues, 0.95))}` : 'n/a';
   summaryEls.total.textContent = totalValues.length ? `${formatMs(percentile(totalValues, 0.5))} / ${formatMs(percentile(totalValues, 0.95))}` : 'n/a';
   summaryEls.failures.textContent = failures.toString();
 }
@@ -446,9 +505,12 @@ function resetLoadtestState(concurrency, latencyBudgetMs) {
     results: Array.from({ length: concurrency }, (_, index) => ({
       index: index + 1,
       status: 'pending',
+      sample: '',
+      model: '',
+      voice: '',
       httpMs: null,
-      firstTokenMs: null,
-      firstAudioChunkMs: null,
+      ttftMs: null,
+      ttfaMs: null,
       totalGenerationMs: null,
       tokenDeltas: null,
       codecTokens: null,
@@ -474,21 +536,61 @@ function finishLoadtest(finalState, message) {
   updateLoadtestSummary();
 }
 
-async function populateVoices() {
-  const addVoice = (voiceId, selected) => {
-    const option = document.createElement('option');
-    option.value = voiceId;
-    option.textContent = voiceId.charAt(0).toUpperCase() + voiceId.slice(1);
-    option.selected = selected;
-    $voice.appendChild(option);
-  };
+function renderVoiceOptions(profile) {
+  $voice.innerHTML = '';
 
+  if (!profile || !profile.multi_speaker || !profile.voices.length) {
+    $voiceField.style.display = 'none';
+    $voice.disabled = true;
+    return;
+  }
+
+  $voiceField.style.display = '';
+  $voice.disabled = false;
+
+  profile.voices.forEach((voice) => {
+    const option = document.createElement('option');
+    option.value = voice.id;
+    option.textContent = voice.name || voice.id;
+    option.selected = voice.id === profile.default_voice;
+    $voice.appendChild(option);
+  });
+}
+
+function handleModelChange() {
+  const profile = modelProfiles.get($model.value);
+  renderVoiceOptions(profile);
+}
+
+function installModels(models, defaultModel) {
+  modelProfiles.clear();
+  $model.innerHTML = '';
+
+  models.forEach((profile) => {
+    modelProfiles.set(profile.id, profile);
+    const option = document.createElement('option');
+    option.value = profile.id;
+    option.textContent = profile.display_name || profile.id;
+    option.selected = profile.id === defaultModel;
+    $model.appendChild(option);
+  });
+
+  if (!models.find((m) => m.id === defaultModel) && models.length) {
+    $model.value = models[0].id;
+  }
+
+  handleModelChange();
+}
+
+async function populateModels() {
   try {
-    const response = await fetch('/v1/voices');
+    const response = await fetch('/v1/models');
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
-    data.voices.forEach((voice) => addVoice(voice.id, voice.id === data.default));
-  } catch {
-    FALLBACK_VOICES.forEach((voiceId, index) => addVoice(voiceId, index === 0));
+    installModels(data.models, data.default);
+  } catch (error) {
+    console.warn('Falling back to static model list:', error);
+    installModels(FALLBACK_MODELS, FALLBACK_DEFAULT_MODEL);
   }
 }
 
@@ -622,6 +724,9 @@ function stopGeneration() {
 async function runLoadtestRequest(result, payload, signal) {
   const requestStarted = performance.now();
   result.status = 'running';
+  result.sample = payload.input;
+  result.model = payload.model || '';
+  result.voice = payload.voice || '';
   renderLoadtestResults();
 
   try {
@@ -642,8 +747,8 @@ async function runLoadtestRequest(result, payload, signal) {
     const data = await response.json();
     result.status = 'completed';
     result.requestId = data.request_id;
-    result.firstTokenMs = data.first_token_ms;
-    result.firstAudioChunkMs = data.first_audio_chunk_ms;
+    result.ttftMs = data.ttft_ms;
+    result.ttfaMs = data.ttfa_ms;
     result.totalGenerationMs = data.total_generation_ms;
     result.tokenDeltas = data.token_deltas;
     result.codecTokens = data.codec_tokens;
@@ -697,6 +802,7 @@ $btnGen.addEventListener('click', startGeneration);
 $btnStop.addEventListener('click', stopGeneration);
 $btnLoadtest.addEventListener('click', startLoadtest);
 $btnLoadtestStop.addEventListener('click', stopLoadtest);
+$model.addEventListener('change', handleModelChange);
 
 $text.addEventListener('keydown', (event) => {
   if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
@@ -705,7 +811,7 @@ $text.addEventListener('keydown', (event) => {
   }
 });
 
-populateVoices();
+populateModels();
 updateLoadtestSummary();
 </script>
 </body>

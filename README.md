@@ -21,7 +21,27 @@ produced.
 
 - Python 3.10+
 - NVIDIA GPU with CUDA 12.x+ (tested on RTX 4090 / A100 / H100)
-- ~8 GB VRAM for the 3B model at bfloat16
+- ~8 GB VRAM for a single 3B model at bfloat16 (≥16 GB if loading both
+  English and Turkish models concurrently)
+
+## Available models
+
+The server can serve multiple Orpheus-compatible checkpoints at the same
+time. Select one per request via the ``model`` field (or the model drop-down
+in the UI). Built-in profiles:
+
+| id           | Checkpoint                         | Language | Speakers        |
+|--------------|------------------------------------|----------|-----------------|
+| `orpheus-en` | `canopylabs/orpheus-3b-0.1-ft`     | English  | Multi (8 voices)|
+| `orpheus-tr` | `yaltay/tmp_tmp_smp`               | Turkish  | Single-speaker  |
+
+The Turkish profile is an Unsloth fine-tune of Orpheus 3B – it is a
+single-speaker model, so the `voice` field is ignored for it.
+
+Enable or disable models via `ENABLED_MODELS` (comma-separated ids) and
+point `DEFAULT_MODEL` at the one you want to use when the request omits
+a model id. Additional custom profiles can be declared in a JSON file
+referenced by `MODELS_FILE`.
 
 ## Quick start
 
@@ -50,7 +70,16 @@ Streams raw PCM audio (24 kHz, 16-bit, mono). Lowest latency option.
 ```bash
 curl -X POST http://localhost:8000/v1/audio/speech/stream \
   -H "Content-Type: application/json" \
-  -d '{"input": "Hello, how are you today?", "voice": "tara"}' \
+  -d '{"input": "Hello, how are you today?", "model": "orpheus-en", "voice": "tara"}' \
+  --output speech.pcm
+```
+
+Turkish model (single-speaker – omit `voice`):
+
+```bash
+curl -X POST http://localhost:8000/v1/audio/speech/stream \
+  -H "Content-Type: application/json" \
+  -d '{"input": "Merhaba, bugün nasılsın?", "model": "orpheus-tr"}' \
   --output speech.pcm
 ```
 
@@ -96,8 +125,8 @@ Example response:
   "codec_tokens": 617,
   "audio_chunks": 88,
   "audio_bytes": 360448,
-  "first_token_ms": 74.2,
-  "first_audio_chunk_ms": 191.6,
+  "ttft_ms": 74.2,
+  "ttfa_ms": 191.6,
   "total_generation_ms": 1842.9
 }
 ```
@@ -113,9 +142,18 @@ WebSocket endpoint for bidirectional streaming. Send a JSON message:
 The server streams back binary PCM frames, followed by a final JSON
 `{"done": true}` message.
 
-### `GET /v1/voices`
+### `GET /v1/models`
 
-List available voice identifiers.
+List all loaded models with their voices and language metadata.
+
+```bash
+curl http://localhost:8000/v1/models
+```
+
+### `GET /v1/voices?model=<id>`
+
+List available voice identifiers for a specific model. Returns an empty
+list for single-speaker models.
 
 ### `GET /health`
 
@@ -123,14 +161,15 @@ Service health check.
 
 ## Request body
 
-| Field               | Type    | Default | Description                     |
-|---------------------|---------|---------|---------------------------------|
-| `input`             | string  | —       | Text to synthesize (required)   |
-| `voice`             | string  | `tara`  | Speaker voice                   |
-| `temperature`       | float   | 0.4     | Sampling temperature            |
-| `top_p`             | float   | 0.9     | Nucleus sampling threshold      |
-| `max_tokens`        | int     | 1200    | Max tokens to generate          |
-| `repetition_penalty`| float   | 1.1     | Repetition penalty              |
+| Field               | Type    | Default           | Description                                           |
+|---------------------|---------|-------------------|-------------------------------------------------------|
+| `input`             | string  | —                 | Text to synthesize (required)                         |
+| `model`             | string  | `DEFAULT_MODEL`   | Model id, e.g. `orpheus-en` or `orpheus-tr`           |
+| `voice`             | string  | model default     | Speaker voice (ignored for single-speaker models)     |
+| `temperature`       | float   | 0.4               | Sampling temperature                                  |
+| `top_p`             | float   | 0.9               | Nucleus sampling threshold                            |
+| `max_tokens`        | int     | 1200              | Max tokens to generate                                |
+| `repetition_penalty`| float   | 1.1               | Repetition penalty                                    |
 
 ## Configuration
 
@@ -150,16 +189,21 @@ during audio decoding.
 
 ## Voices
 
-`tara` · `zoe` · `jess` · `zac` · `leo` · `mia` · `julia` · `leah`
+English (`orpheus-en`): `tara` · `zoe` · `jess` · `zac` · `leo` · `mia` · `julia` · `leah`
+
+Turkish (`orpheus-tr`): single-speaker – omit the `voice` field.
 
 ## Built-in UI
 
 The browser UI now includes:
 
+- A model selector that switches voices / hides the voice field for
+  single-speaker checkpoints
 - Single-request streaming playback for listening tests
 - A concurrency load-test panel with selectable parallel request count
 - Aggregate P50/P95 latency stats and a per-request timing table
-- Budget checks for first-token and end-to-end generation latency
+- Per-request sample visibility so you can see exactly what was sent
+- Budget checks for TTFA and end-to-end generation latency
 
 ## License
 

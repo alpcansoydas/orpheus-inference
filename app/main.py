@@ -7,14 +7,17 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from .config import settings
 from .decoder import SNACDecoder
 from .engine import OrpheusEngine
+from .models_registry import ModelProfile, ModelRegistry
 from .schemas import (
     HealthResponse,
+    ModelInfo,
+    ModelsResponse,
     SpeechMetricsResponse,
     TTSRequest,
     VoiceInfo,
@@ -23,13 +26,14 @@ from .schemas import (
 
 logger = logging.getLogger(__name__)
 
-engine: OrpheusEngine | None = None
+registry: ModelRegistry | None = None
+engines: dict[str, OrpheusEngine] = {}
 decoder: SNACDecoder | None = None
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global engine, decoder  # noqa: PLW0603
+    global registry, decoder  # noqa: PLW0603
 
     logging.basicConfig(
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
@@ -37,20 +41,49 @@ async def lifespan(_app: FastAPI):
     )
 
     logger.info("Starting Orpheus TTS server …")
-    engine = OrpheusEngine(settings)
+    registry = ModelRegistry.from_config(
+        settings.enabled_model_ids,
+        overrides_file=settings.models_file or None,
+    )
+
+    profiles = registry.all()
+    if settings.default_model not in registry:
+        raise RuntimeError(
+            f"DEFAULT_MODEL='{settings.default_model}' is not in enabled models: "
+            f"{registry.ids()}"
+        )
+
+    per_model_gpu = settings.resolve_gpu_memory_utilization(len(profiles))
+    logger.info(
+        "Loading %d model(s) – %s – per-engine gpu_memory_utilization=%.2f",
+        len(profiles),
+        [p.id for p in profiles],
+        per_model_gpu,
+    )
+
+    for profile in profiles:
+        engines[profile.id] = OrpheusEngine(
+            settings,
+            profile,
+            gpu_memory_utilization=per_model_gpu,
+        )
+
     decoder = SNACDecoder(settings.snac_model_name, device=settings.snac_device)
-    logger.info("Server ready – accepting requests")
+    logger.info(
+        "Server ready – default model=%s – accepting requests",
+        settings.default_model,
+    )
 
     yield
 
     logger.info("Shutting down …")
-    engine = None
-    decoder = None
+    engines.clear()
+    decoder = None  # noqa: F841
 
 
 app = FastAPI(
     title="Orpheus TTS",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
     default_response_class=JSONResponse,
 )
@@ -67,22 +100,60 @@ async def ui():
 # ── helpers ───────────────────────────────────────────────────────
 
 
-def _validate_voice(voice: str) -> str:
-    if voice not in settings.voice_list:
+def _resolve_profile(model_id: str | None) -> ModelProfile:
+    assert registry is not None  # noqa: S101
+    target = model_id or settings.default_model
+    if target not in registry:
         raise HTTPException(
             status_code=422,
-            detail=f"Unknown voice '{voice}'. Available: {settings.voice_list}",
+            detail=f"Unknown model '{target}'. Available: {registry.ids()}",
         )
-    return voice
+    return registry.get(target)
 
 
-async def _audio_stream(req: TTSRequest) -> AsyncIterator[bytes]:
+def _resolve_voice(profile: ModelProfile, voice: str | None) -> str:
+    try:
+        profile.validate_voice(voice)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return profile.resolve_voice(voice)
+
+
+def _engine_for(profile: ModelProfile) -> OrpheusEngine:
+    try:
+        return engines[profile.id]
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Engine for model '{profile.id}' is not ready",
+        ) from exc
+
+
+def _profile_to_info(profile: ModelProfile) -> ModelInfo:
+    return ModelInfo(
+        id=profile.id,
+        display_name=profile.display_name,
+        model_name=profile.model_name,
+        language=profile.language,
+        description=profile.description,
+        multi_speaker=profile.is_multi_speaker,
+        voices=[VoiceInfo(id=v, name=v.capitalize()) for v in profile.voices],
+        default_voice=profile.default_voice,
+    )
+
+
+async def _audio_stream(
+    req: TTSRequest,
+    profile: ModelProfile,
+    voice: str,
+) -> AsyncIterator[bytes]:
     """Orchestrates the full pipeline: text → vLLM tokens → SNAC decode → PCM chunks."""
-    assert engine is not None and decoder is not None  # noqa: S101
+    assert decoder is not None  # noqa: S101
+    engine = _engine_for(profile)
 
     token_gen = engine.generate_tokens(
         text=req.input,
-        voice=req.voice,
+        voice=voice,
         temperature=req.temperature,
         top_p=req.top_p,
         max_tokens=req.max_tokens,
@@ -99,43 +170,59 @@ async def _audio_stream(req: TTSRequest) -> AsyncIterator[bytes]:
         total_bytes += len(chunk)
         chunk_idx += 1
         if chunk_idx <= 3 or chunk_idx % 20 == 0:
-            logger.debug("Audio chunk #%d: %d bytes (total %d)", chunk_idx, len(chunk), total_bytes)
+            logger.debug(
+                "Audio chunk #%d: %d bytes (total %d) model=%s",
+                chunk_idx,
+                len(chunk),
+                total_bytes,
+                profile.id,
+            )
         yield chunk
 
-    logger.info("Stream finished: %d chunks, %d bytes", chunk_idx, total_bytes)
+    logger.info(
+        "Stream finished: model=%s chunks=%d bytes=%d",
+        profile.id,
+        chunk_idx,
+        total_bytes,
+    )
 
 
-async def _collect_speech_metrics(req: TTSRequest) -> SpeechMetricsResponse:
+async def _collect_speech_metrics(
+    req: TTSRequest,
+    profile: ModelProfile,
+    voice: str,
+) -> SpeechMetricsResponse:
     """Run the full pipeline and return latency and throughput metrics."""
-    assert engine is not None and decoder is not None  # noqa: S101
+    assert decoder is not None  # noqa: S101
+    engine = _engine_for(profile)
 
     request_id = uuid.uuid4().hex
     started = time.perf_counter()
-    first_token_ms: float | None = None
-    first_audio_chunk_ms: float | None = None
+    ttft_ms: float | None = None
+    ttfa_ms: float | None = None
     token_deltas = 0
     codec_tokens = 0
     audio_chunks = 0
     audio_bytes = 0
 
     async def _instrumented_tokens() -> AsyncIterator[str]:
-        nonlocal first_token_ms, token_deltas, codec_tokens
+        nonlocal ttft_ms, token_deltas, codec_tokens
 
         async for delta in engine.generate_tokens(
             text=req.input,
-            voice=req.voice,
+            voice=voice,
             temperature=req.temperature,
             top_p=req.top_p,
             max_tokens=req.max_tokens,
             repetition_penalty=req.repetition_penalty,
             request_id=request_id,
         ):
+            if ttft_ms is None:
+                ttft_ms = (time.perf_counter() - started) * 1000
+            token_deltas += 1
             token_count = decoder.count_codec_tokens(delta)
             if token_count:
-                token_deltas += 1
                 codec_tokens += token_count
-                if first_token_ms is None:
-                    first_token_ms = (time.perf_counter() - started) * 1000
             yield delta
 
     async for chunk in decoder.decode_stream(
@@ -145,28 +232,30 @@ async def _collect_speech_metrics(req: TTSRequest) -> SpeechMetricsResponse:
     ):
         audio_chunks += 1
         audio_bytes += len(chunk)
-        if first_audio_chunk_ms is None:
-            first_audio_chunk_ms = (time.perf_counter() - started) * 1000
+        if ttfa_ms is None:
+            ttfa_ms = (time.perf_counter() - started) * 1000
 
     total_generation_ms = (time.perf_counter() - started) * 1000
     logger.info(
-        "Metrics request complete: id=%s first_token=%.1fms first_audio=%.1fms total=%.1fms",
+        "Metrics request complete: id=%s model=%s ttft=%.1fms ttfa=%.1fms total=%.1fms",
         request_id,
-        first_token_ms or -1.0,
-        first_audio_chunk_ms or -1.0,
+        profile.id,
+        ttft_ms or -1.0,
+        ttfa_ms or -1.0,
         total_generation_ms,
     )
     return SpeechMetricsResponse(
         request_id=request_id,
         status="completed",
-        voice=req.voice,
+        model=profile.id,
+        voice=voice or None,
         input_chars=len(req.input),
         token_deltas=token_deltas,
         codec_tokens=codec_tokens,
         audio_chunks=audio_chunks,
         audio_bytes=audio_bytes,
-        first_token_ms=first_token_ms,
-        first_audio_chunk_ms=first_audio_chunk_ms,
+        ttft_ms=ttft_ms,
+        ttfa_ms=ttfa_ms,
         total_generation_ms=total_generation_ms,
     )
 
@@ -185,17 +274,20 @@ async def tts_stream(req: TTSRequest):
     Audio chunks are emitted as soon as the model has produced enough tokens,
     keeping time-to-first-byte as low as possible.
     """
-    _validate_voice(req.voice)
+    profile = _resolve_profile(req.model)
+    voice = _resolve_voice(profile, req.voice)
+
     t0 = time.perf_counter()
 
     async def _generate():
         first = True
-        async for chunk in _audio_stream(req):
+        async for chunk in _audio_stream(req, profile, voice):
             if first:
                 logger.info(
-                    "TTFB %.1f ms  voice=%s  text=%.60s…",
+                    "TTFB %.1f ms  model=%s  voice=%s  text=%.60s…",
                     (time.perf_counter() - t0) * 1000,
-                    req.voice,
+                    profile.id,
+                    voice or "-",
                     req.input,
                 )
                 first = False
@@ -208,6 +300,7 @@ async def tts_stream(req: TTSRequest):
             "X-Sample-Rate": str(SNACDecoder.SAMPLE_RATE),
             "X-Bit-Depth": str(SNACDecoder.BIT_DEPTH),
             "X-Channels": str(SNACDecoder.CHANNELS),
+            "X-Model": profile.id,
         },
     )
 
@@ -222,10 +315,11 @@ async def tts_full(req: TTSRequest):
     import struct
     import io
 
-    _validate_voice(req.voice)
+    profile = _resolve_profile(req.model)
+    voice = _resolve_voice(profile, req.voice)
 
     pcm_chunks: list[bytes] = []
-    async for chunk in _audio_stream(req):
+    async for chunk in _audio_stream(req, profile, voice):
         pcm_chunks.append(chunk)
 
     pcm_data = b"".join(pcm_chunks)
@@ -249,7 +343,10 @@ async def tts_full(req: TTSRequest):
     return StreamingResponse(
         buf,
         media_type="audio/wav",
-        headers={"Content-Disposition": 'attachment; filename="speech.wav"'},
+        headers={
+            "Content-Disposition": 'attachment; filename="speech.wav"',
+            "X-Model": profile.id,
+        },
     )
 
 
@@ -260,23 +357,51 @@ async def tts_full(req: TTSRequest):
     summary="Generate speech and return per-request timing metrics",
 )
 async def tts_metrics(req: TTSRequest):
-    _validate_voice(req.voice)
-    return await _collect_speech_metrics(req)
+    profile = _resolve_profile(req.model)
+    voice = _resolve_voice(profile, req.voice)
+    return await _collect_speech_metrics(req, profile, voice)
 
 
 # ── utility endpoints ─────────────────────────────────────────────
 
 
+@app.get("/v1/models", response_model=ModelsResponse)
+async def list_models():
+    assert registry is not None  # noqa: S101
+    infos = [_profile_to_info(p) for p in registry.all()]
+    return ModelsResponse(
+        models=infos,
+        default=settings.default_model,
+        count=len(infos),
+    )
+
+
 @app.get("/v1/voices", response_model=VoicesResponse)
-async def list_voices():
-    voices = [VoiceInfo(id=v, name=v.capitalize()) for v in settings.voice_list]
-    return VoicesResponse(voices=voices, default=settings.default_voice, count=len(voices))
+async def list_voices(
+    model: str | None = Query(
+        default=None,
+        description="Model id to list voices for. Defaults to the server's default model.",
+    ),
+):
+    profile = _resolve_profile(model)
+    voices = [VoiceInfo(id=v, name=v.capitalize()) for v in profile.voices]
+    return VoicesResponse(
+        model=profile.id,
+        voices=voices,
+        default=profile.default_voice,
+        count=len(voices),
+    )
 
 
 @app.get("/health", response_model=HealthResponse)
 async def health():
+    ready = sum(1 for e in engines.values() if e.is_ready)
+    total = len(engines)
+    status = "ok" if ready == total and total > 0 and decoder is not None else "degraded"
     return HealthResponse(
-        status="ok" if engine and decoder else "degraded",
-        engine_ready=engine is not None and engine.is_ready,
+        status=status,
+        engines_ready=ready,
+        engines_total=total,
+        models=list(engines.keys()),
         decoder_ready=decoder is not None,
     )
