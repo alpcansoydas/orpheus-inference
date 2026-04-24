@@ -151,10 +151,52 @@ class OrpheusEngine:
             cfg.max_model_len,
             gpu_memory_utilization,
         )
+        requested_pad = cfg.pad_vocab_to_multiple
+
+        try:
+            return OrpheusEngine._build_engine_once(
+                cfg,
+                profile,
+                tokenizer,
+                gpu_memory_utilization=gpu_memory_utilization,
+                pad_multiple=requested_pad,
+            )
+        except Exception as exc:
+            fallback_pad = max(requested_pad, OrpheusEngine._VOCAB_PAD_MINIMUM)
+            if (
+                requested_pad >= fallback_pad
+                or not OrpheusEngine._should_retry_with_padded_vocab(exc)
+            ):
+                raise
+
+            logger.warning(
+                "vLLM engine init failed for model=%s without vocab padding; "
+                "retrying once with PAD_VOCAB_TO_MULTIPLE=%d. Root cause: %s",
+                profile.model_name,
+                fallback_pad,
+                exc,
+            )
+            return OrpheusEngine._build_engine_once(
+                cfg,
+                profile,
+                tokenizer,
+                gpu_memory_utilization=gpu_memory_utilization,
+                pad_multiple=fallback_pad,
+            )
+
+    @staticmethod
+    def _build_engine_once(
+        cfg: Settings,
+        profile: ModelProfile,
+        tokenizer: AutoTokenizer,
+        *,
+        gpu_memory_utilization: float,
+        pad_multiple: int,
+    ) -> AsyncLLMEngine:
         hf_overrides = OrpheusEngine._compute_hf_overrides(
             profile.model_name,
             tokenizer,
-            pad_multiple=cfg.pad_vocab_to_multiple,
+            pad_multiple=pad_multiple,
         )
         args = AsyncEngineArgs(
             model=profile.model_name,
@@ -178,6 +220,17 @@ class OrpheusEngine:
     # causing the kernel to read past the logits tensor.  Padding to 64
     # is the smallest alignment that satisfies current Triton block sizes.
     _VOCAB_PAD_MINIMUM = 64
+
+    @staticmethod
+    def _should_retry_with_padded_vocab(exc: Exception) -> bool:
+        """Detect startup failures that are commonly fixed by padding the
+        vocab size for vLLM's sampler warmup path."""
+        message = str(exc).lower()
+        return (
+            "engine core initialization failed" in message
+            or "illegal memory access" in message
+            or "cuda error" in message
+        )
 
     @staticmethod
     def _compute_hf_overrides(
@@ -209,9 +262,9 @@ class OrpheusEngine:
             len(tokenizer),
             OrpheusEngine._MIN_VOCAB_SIZE,
         )
+        pad = max(pad_multiple, OrpheusEngine._VOCAB_PAD_MINIMUM)
 
         if pad_multiple > 0:
-            pad = max(pad_multiple, OrpheusEngine._VOCAB_PAD_MINIMUM)
             remainder = required % pad
             if remainder:
                 required += pad - remainder
