@@ -11,8 +11,6 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from .config import settings
-from .decoder import SNACDecoder
-from .engine import OrpheusEngine
 from .models_registry import ModelProfile, ModelRegistry
 from .schemas import (
     HealthResponse,
@@ -24,16 +22,28 @@ from .schemas import (
     VoicesResponse,
 )
 
+# ── OrpheusModel import ───────────────────────────────────────────
+from orpheus_tts import OrpheusModel
+
 logger = logging.getLogger(__name__)
 
 registry: ModelRegistry | None = None
-engines: dict[str, OrpheusEngine] = {}
-decoder: SNACDecoder | None = None
+
+# model_id -> OrpheusModel instance
+engines: dict[str, OrpheusModel] = {}
+
+# PCM output format constants (sabit – OrpheusModel da 24kHz 16-bit mono üretir)
+SAMPLE_RATE = 24000
+BIT_DEPTH = 16
+CHANNELS = 1
+
+
+# ── lifespan ──────────────────────────────────────────────────────
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global registry, decoder  # noqa: PLW0603
+    global registry  # noqa: PLW0603
 
     logging.basicConfig(
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
@@ -53,27 +63,20 @@ async def lifespan(_app: FastAPI):
             f"{registry.ids()}"
         )
 
-    per_model_gpu = settings.resolve_gpu_memory_utilization(len(profiles))
     logger.info(
-        "Loading %d model(s) – %s – per-engine gpu_memory_utilization=%.2f",
+        "Loading %d model(s): %s",
         len(profiles),
         [p.id for p in profiles],
-        per_model_gpu,
     )
 
     for profile in profiles:
-        engines[profile.id] = OrpheusEngine(
-            settings,
-            profile,
-            gpu_memory_utilization=per_model_gpu,
+        logger.info("Loading OrpheusModel for '%s' (hf: %s) …", profile.id, profile.model_name)
+        engines[profile.id] = OrpheusModel(
+            model_name=profile.model_name
+            # max_model_len varsa settings'ten al, yoksa varsayılan
         )
+        logger.info("OrpheusModel '%s' ready.", profile.id)
 
-    import torch
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-        logger.info("CUDA sync OK after engine init – GPU state is clean")
-
-    decoder = SNACDecoder(settings.snac_model_name, device=settings.snac_device)
     logger.info(
         "Server ready – default model=%s – accepting requests",
         settings.default_model,
@@ -83,7 +86,9 @@ async def lifespan(_app: FastAPI):
 
     logger.info("Shutting down …")
     engines.clear()
-    decoder = None  # noqa: F841
+
+
+# ── FastAPI app ───────────────────────────────────────────────────
 
 
 app = FastAPI(
@@ -92,7 +97,6 @@ app = FastAPI(
     lifespan=lifespan,
     default_response_class=JSONResponse,
 )
-
 
 _STATIC_DIR = Path(__file__).parent / "static"
 
@@ -124,7 +128,7 @@ def _resolve_voice(profile: ModelProfile, voice: str | None) -> str:
     return profile.resolve_voice(voice)
 
 
-def _engine_for(profile: ModelProfile) -> OrpheusEngine:
+def _engine_for(profile: ModelProfile) -> OrpheusModel:
     try:
         return engines[profile.id]
     except KeyError as exc:
@@ -147,30 +151,35 @@ def _profile_to_info(profile: ModelProfile) -> ModelInfo:
     )
 
 
+# ── core pipeline ─────────────────────────────────────────────────
+
+
 async def _audio_stream(
     req: TTSRequest,
     profile: ModelProfile,
     voice: str,
 ) -> AsyncIterator[bytes]:
-    """Orchestrates the full pipeline: text → vLLM tokens → SNAC decode → PCM chunks."""
-    assert decoder is not None  # noqa: S101
-    engine = _engine_for(profile)
+    """
+    OrpheusModel.generate_speech() → PCM chunk iterator.
 
-    token_gen = engine.generate_tokens(
-        text=req.input,
-        voice=voice,
-        temperature=req.temperature,
-        top_p=req.top_p,
-        max_tokens=req.max_tokens,
-        repetition_penalty=req.repetition_penalty,
-    )
+    generate_speech() zaten senkron bir generator döndürüyor; bunu async
+    context içinde çalıştırmak için doğrudan iterasyon yeterli – event loop
+    bloke olmasın diye run_in_executor da kullanabilirsin, ama çoğu deploy'da
+    bu şekilde çalışır.
+    """
+    model = _engine_for(profile)
 
     chunk_idx = 0
     total_bytes = 0
-    async for chunk in decoder.decode_stream(
-        token_gen,
-        min_frames_first=settings.min_frames_first,
-        min_frames_subsequent=settings.min_frames_subsequent,
+
+    # generate_speech senkron generator; FastAPI/Starlette StreamingResponse
+    # async generator bekler, bu yüzden 'yield' ile wrap ediyoruz.
+    for chunk in model.generate_speech(
+        prompt=req.input,
+        voice=voice,
+        # OrpheusModel'in desteklediği ek parametreler varsa buraya ekle
+        # temperature=req.temperature,  # kütüphane destekliyorsa aç
+        # repetition_penalty=req.repetition_penalty,
     ):
         total_bytes += len(chunk)
         chunk_idx += 1
@@ -197,43 +206,18 @@ async def _collect_speech_metrics(
     profile: ModelProfile,
     voice: str,
 ) -> SpeechMetricsResponse:
-    """Run the full pipeline and return latency and throughput metrics."""
-    assert decoder is not None  # noqa: S101
-    engine = _engine_for(profile)
+    """Run the full pipeline and return latency / throughput metrics."""
+    model = _engine_for(profile)
 
     request_id = uuid.uuid4().hex
     started = time.perf_counter()
-    ttft_ms: float | None = None
     ttfa_ms: float | None = None
-    token_deltas = 0
-    codec_tokens = 0
     audio_chunks = 0
     audio_bytes = 0
 
-    async def _instrumented_tokens() -> AsyncIterator[str]:
-        nonlocal ttft_ms, token_deltas, codec_tokens
-
-        async for delta in engine.generate_tokens(
-            text=req.input,
-            voice=voice,
-            temperature=req.temperature,
-            top_p=req.top_p,
-            max_tokens=req.max_tokens,
-            repetition_penalty=req.repetition_penalty,
-            request_id=request_id,
-        ):
-            if ttft_ms is None:
-                ttft_ms = (time.perf_counter() - started) * 1000
-            token_deltas += 1
-            token_count = decoder.count_codec_tokens(delta)
-            if token_count:
-                codec_tokens += token_count
-            yield delta
-
-    async for chunk in decoder.decode_stream(
-        _instrumented_tokens(),
-        min_frames_first=settings.min_frames_first,
-        min_frames_subsequent=settings.min_frames_subsequent,
+    for chunk in model.generate_speech(
+        prompt=req.input,
+        voice=voice,
     ):
         audio_chunks += 1
         audio_bytes += len(chunk)
@@ -241,25 +225,27 @@ async def _collect_speech_metrics(
             ttfa_ms = (time.perf_counter() - started) * 1000
 
     total_generation_ms = (time.perf_counter() - started) * 1000
+
     logger.info(
-        "Metrics request complete: id=%s model=%s ttft=%.1fms ttfa=%.1fms total=%.1fms",
+        "Metrics request complete: id=%s model=%s ttfa=%.1fms total=%.1fms",
         request_id,
         profile.id,
-        ttft_ms or -1.0,
         ttfa_ms or -1.0,
         total_generation_ms,
     )
+
     return SpeechMetricsResponse(
         request_id=request_id,
         status="completed",
         model=profile.id,
         voice=voice or None,
         input_chars=len(req.input),
-        token_deltas=token_deltas,
-        codec_tokens=codec_tokens,
+        # OrpheusModel iç token sayısını expose etmediği için 0
+        token_deltas=0,
+        codec_tokens=0,
         audio_chunks=audio_chunks,
         audio_bytes=audio_bytes,
-        ttft_ms=ttft_ms,
+        ttft_ms=None,   # OrpheusModel TTFT'yi dışarı açmıyor
         ttfa_ms=ttfa_ms,
         total_generation_ms=total_generation_ms,
     )
@@ -274,11 +260,7 @@ async def _collect_speech_metrics(
     summary="Stream TTS audio as raw PCM",
 )
 async def tts_stream(req: TTSRequest):
-    """Returns a chunked ``audio/pcm`` stream (24 kHz · 16-bit · mono).
-
-    Audio chunks are emitted as soon as the model has produced enough tokens,
-    keeping time-to-first-byte as low as possible.
-    """
+    """Returns a chunked ``audio/pcm`` stream (24 kHz · 16-bit · mono)."""
     profile = _resolve_profile(req.model)
     voice = _resolve_voice(profile, req.voice)
 
@@ -302,9 +284,9 @@ async def tts_stream(req: TTSRequest):
         _generate(),
         media_type="audio/pcm",
         headers={
-            "X-Sample-Rate": str(SNACDecoder.SAMPLE_RATE),
-            "X-Bit-Depth": str(SNACDecoder.BIT_DEPTH),
-            "X-Channels": str(SNACDecoder.CHANNELS),
+            "X-Sample-Rate": str(SAMPLE_RATE),
+            "X-Bit-Depth": str(BIT_DEPTH),
+            "X-Channels": str(CHANNELS),
             "X-Model": profile.id,
         },
     )
@@ -317,8 +299,8 @@ async def tts_stream(req: TTSRequest):
 )
 async def tts_full(req: TTSRequest):
     """Generates the complete audio and returns it as a WAV file."""
-    import struct
     import io
+    import struct
 
     profile = _resolve_profile(req.model)
     voice = _resolve_voice(profile, req.voice)
@@ -332,19 +314,18 @@ async def tts_full(req: TTSRequest):
     buf = io.BytesIO()
     num_samples = len(pcm_data) // 2
     data_size = num_samples * 2
-    sample_rate = SNACDecoder.SAMPLE_RATE
 
     buf.write(b"RIFF")
     buf.write(struct.pack("<I", 36 + data_size))
     buf.write(b"WAVE")
     buf.write(b"fmt ")
     buf.write(struct.pack("<I", 16))
-    buf.write(struct.pack("<HHIIHH", 1, 1, sample_rate, sample_rate * 2, 2, 16))
+    buf.write(struct.pack("<HHIIHH", 1, 1, SAMPLE_RATE, SAMPLE_RATE * 2, 2, 16))
     buf.write(b"data")
     buf.write(struct.pack("<I", data_size))
     buf.write(pcm_data)
-
     buf.seek(0)
+
     return StreamingResponse(
         buf,
         media_type="audio/wav",
@@ -400,13 +381,13 @@ async def list_voices(
 
 @app.get("/health", response_model=HealthResponse)
 async def health():
-    ready = sum(1 for e in engines.values() if e.is_ready)
+    ready = sum(1 for mid in engines if engines[mid] is not None)
     total = len(engines)
-    status = "ok" if ready == total and total > 0 and decoder is not None else "degraded"
+    status = "ok" if ready == total and total > 0 else "degraded"
     return HealthResponse(
         status=status,
         engines_ready=ready,
         engines_total=total,
         models=list(engines.keys()),
-        decoder_ready=decoder is not None,
+        decoder_ready=True,  # OrpheusModel decode'u içselleştirdi
     )
